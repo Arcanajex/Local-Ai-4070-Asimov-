@@ -59,6 +59,11 @@ def main(argv: list[str] | None = None) -> int:
     overnight.add_argument("--max-iterations", type=int, default=6)
     overnight.add_argument("--test-command")
     overnight.add_argument("--lint-command")
+    overnight.add_argument(
+        "--init-repo",
+        action="store_true",
+        help="If the project is not a git repository, git init and create an empty initial commit.",
+    )
     overnight.set_defaults(func=_overnight)
 
     tune = sub.add_parser("tune", help="Sweep offload values and write runtime/overrides.json.")
@@ -139,6 +144,7 @@ def _overnight(args: argparse.Namespace) -> int:
         max_seconds=args.max_hours * 3600,
         test_command=args.test_command,
         lint_command=args.lint_command,
+        init_repo=args.init_repo,
     )
     print(
         json.dumps(
