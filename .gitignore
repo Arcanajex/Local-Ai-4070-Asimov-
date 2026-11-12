@@ -1,0 +1,22 @@
+# Local runtime created by scripts/setup.ps1 (llama.cpp binaries, models, venv, logs).
+runtime/
+logs/
+.agent-logs/
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+
+# Model weights are downloaded, never committed.
+*.gguf
+*.partial
+
+# Editor / OS
+.DS_Store
+Thumbs.db
