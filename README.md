@@ -38,6 +38,9 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 # Overnight task against a clean git repo.
 .\scripts\overnight.ps1 -Task .\tasks\smoke-task.md -Project C:\src\my-app -Profile quality
+
+# A folder of ordered tasks, unattended. Passing branches merge back into the project branch.
+.\scripts\queue.ps1 -TaskDir C:\src\my-app\tasks -Project C:\src\my-app -Profile quality
 ```
 
 Plug the laptop in before `setup.ps1` downloads anything large, and leave it plugged in for every server and overnight run.
@@ -272,6 +275,40 @@ Logs:
 
 - `runtime\logs\overnight-*.log` is the PowerShell transcript.
 - `runtime\logs\run-*\events.jsonl` is every model turn.
+
+## Task queue
+
+Use this when a job is split into ordered markdown files and nobody will be around to merge and start the next one.
+
+```text
+C:\src\my-app\tasks\
+  01-runner.md
+  02-status.md
+  03-window.md
+  04-notify.md
+```
+
+```powershell
+.\scripts\queue.ps1 -TaskDir C:\src\my-app\tasks -Project C:\src\my-app -Profile quality
+```
+
+The same thing without the Windows stay-awake, power scheme, server launch, or toast:
+
+```powershell
+python -m local_agent queue --task-dir C:\src\my-app\tasks --project C:\src\my-app --profile quality
+```
+
+What it does:
+
+1. Holds sleep off and switches to the High performance power scheme for the whole queue, then restores the previous scheme. `llama-server` is started once if it is not already healthy.
+2. Runs `*.md` in the task folder in natural filename order (`2` before `10`). `README.md`, `queue-summary.md`, and files already inside `done\` or `failed\` are not tasks.
+3. Each file is an overnight run. The branch checked out at the start is remembered in `queue-state.json`.
+4. When tests pass, that agent branch is merged with `--no-ff` back into the remembered branch. The next file starts from the merge.
+5. When tests fail, the queue stops. The failed branch is not merged, and the project is checked out on the base branch again so a later retry does not build on the failure. `-ContinueOnFailure` runs the remaining files from that last good merge anyway.
+6. A passing file is moved to `done\`. A failing file is moved to `failed\`. `queue-state.json` records status, branch, commit, iterations, and duration. Run the same command again to resume: passed tasks are skipped. To retry a failure, move its file from `failed\` back into the task folder.
+7. `queue-summary.md` in the task folder lists every task. When the queue ends, Windows shows a toast and plays a beep. If the toast cannot be shown, the script warns and still exits with the real result.
+
+`-InitRepo` and `-MaxHoursPerTask` match the overnight switches. `-MaxHoursPerTask` is the budget for each file, not the whole queue.
 
 If the time budget hits first, the branch and the report are still written. The script's exit code is 0 only when the test command passed.
 

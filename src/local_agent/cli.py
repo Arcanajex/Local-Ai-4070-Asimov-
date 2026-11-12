@@ -12,6 +12,7 @@ from local_agent.client import server_is_healthy
 from local_agent.config import get_profile, list_profiles
 from local_agent.download import DownloadError, download_file
 from local_agent.overnight import load_task, make_client, run_overnight
+from local_agent.queue import run_queue
 from local_agent.paths import runtime_dir
 from local_agent.releases import resolve_windows_cuda_plan
 from local_agent.server_args import args_for_profile, format_args
@@ -65,6 +66,26 @@ def main(argv: list[str] | None = None) -> int:
         help="If the project is not a git repository, git init and create an empty initial commit.",
     )
     overnight.set_defaults(func=_overnight)
+
+    queue = sub.add_parser("queue", help="Run a folder of task files, one at a time.")
+    queue.add_argument("--task-dir", required=True, type=Path)
+    queue.add_argument("--project", required=True, type=Path)
+    queue.add_argument("--profile", default="quality")
+    queue.add_argument("--base-url")
+    queue.add_argument("--log-dir", type=Path)
+    queue.add_argument("--max-hours-per-task", type=float, default=8.0)
+    queue.add_argument("--max-iterations", type=int, default=6)
+    queue.add_argument(
+        "--init-repo",
+        action="store_true",
+        help="If the project is not a git repository, git init and create an empty initial commit.",
+    )
+    queue.add_argument(
+        "--continue-on-failure",
+        action="store_true",
+        help="Run later task files even when one fails. The failed branch is not merged.",
+    )
+    queue.set_defaults(func=_queue)
 
     tune = sub.add_parser("tune", help="Sweep offload values and write runtime/overrides.json.")
     tune.add_argument("--profile", required=True)
@@ -160,6 +181,37 @@ def _overnight(args: argparse.Namespace) -> int:
         )
     )
     return 0 if result.tests_passed else 1
+
+
+def _queue(args: argparse.Namespace) -> int:
+    profile = get_profile(args.profile)
+    log_dir = args.log_dir or (runtime_dir() / "logs" / "queue")
+    result = run_queue(
+        task_dir=args.task_dir,
+        project=args.project,
+        profile=profile,
+        client=make_client(profile, args.base_url),
+        log_dir=log_dir,
+        max_seconds_per_task=args.max_hours_per_task * 3600,
+        max_iterations=args.max_iterations,
+        init_repo=args.init_repo,
+        continue_on_failure=args.continue_on_failure,
+    )
+    print(
+        json.dumps(
+            {
+                "status": result.status,
+                "base_branch": result.base_branch,
+                "passed": result.passed,
+                "failed": result.failed,
+                "skipped": result.skipped,
+                "stopped_on": result.stopped_on,
+                "summary": str(result.summary_path),
+                "state": str(result.state_path),
+            }
+        )
+    )
+    return 0 if result.status == "passed" else 1
 
 
 def _tune(args: argparse.Namespace) -> int:
