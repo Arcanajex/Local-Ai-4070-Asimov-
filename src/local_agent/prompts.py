@@ -62,5 +62,7 @@ def review_prompt(task: str, diff: str, tests_ok: bool) -> str:
         "Tests: what was verified and what was not.\n"
         "Risks: concrete leftover bugs or edge cases.\n"
         "Verdict: accept or fix. Use 'fix' only for a defect you can point at in the diff.\n\n"
-        f"{status}\n\nTASK:\n{task}\n\nDIFF:\n{diff}"
+        f"{status}\n\nTASK:\n{task}\n\n"
+        "DIFF (every changed and new file; new files are shown in full):\n"
+        f"{diff}"
     )

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -111,6 +112,7 @@ def run_overnight(
     max_work_turns: int = 30,
     test_command: str | None = None,
     lint_command: str | None = None,
+    init_repo: bool = False,
 ) -> OvernightResult:
     project = Path(project).resolve()
     logger = RunLogger(log_dir)
@@ -118,14 +120,19 @@ def run_overnight(
     deadline = started + max_seconds
     test_cmd = test_command or task.test_command
     lint_cmd = lint_command if lint_command is not None else task.lint_command
-    workspace = Workspace(project)
     branch = ""
     iterations = 0
     tests_passed = False
     test_output = ""
     plan_status = "not_started"
+    identity_note = ""
     try:
+        identity_note = ensure_repository(project, init_repo=init_repo) or ""
+        if identity_note:
+            logger.event("git_identity", summary=identity_note)
+            print(identity_note, file=sys.stderr)
         _require_clean_git(project)
+        workspace = Workspace(project)
         branch = _create_branch(project, slugify(task.title))
         logger.event("run_start", branch=branch, profile=profile.name, task=task.title, summary=branch)
 
@@ -147,6 +154,7 @@ def run_overnight(
                 status="time_budget", iterations=0, tests_passed=False,
                 test_output="", review="Stopped before implementation because the time budget was spent.",
                 plan_status=plan.status,
+                identity_note=identity_note,
             )
 
         implement = _run_phase(
@@ -210,7 +218,7 @@ def run_overnight(
 
         review_text = ""
         if time.monotonic() < deadline:
-            diff = shrink_text(_diff(project), 24_000)
+            diff = shrink_text(working_tree_diff(project), 24_000)
             review = _run_phase(
                 client, workspace, logger, profile,
                 review_prompt(task.body, diff, tests_passed),
@@ -229,6 +237,7 @@ def run_overnight(
             test_output=test_output,
             review=review_text,
             plan_status=plan.status,
+            identity_note=identity_note,
         )
     except Exception as exc:
         logger.event("run_error", summary=f"{type(exc).__name__}: {exc}")
@@ -242,6 +251,7 @@ def run_overnight(
                     test_output=test_output,
                     review=f"The run stopped with an error:\n\n{exc}",
                     plan_status=plan_status,
+                    identity_note=identity_note,
                 )
             except Exception:
                 pass
@@ -297,6 +307,7 @@ def _finish(
     test_output: str,
     review: str,
     plan_status: str,
+    identity_note: str = "",
 ) -> OvernightResult:
     report = _render_report(
         task=task,
@@ -309,6 +320,7 @@ def _finish(
         review=review,
         plan_status=plan_status,
         log_dir=log_dir,
+        identity_note=identity_note,
     )
     report_path = project / REPORT_FILE
     report_path.write_text(report, encoding="utf-8", newline="\n")
@@ -337,7 +349,9 @@ def _render_report(
     review: str,
     plan_status: str,
     log_dir: Path,
+    identity_note: str = "",
 ) -> str:
+    note = f"\n{identity_note}\n" if identity_note else ""
     return (
         f"# Agent report\n\n"
         f"- Status: {status}\n"
@@ -347,7 +361,8 @@ def _render_report(
         f"- Branch: {branch}\n"
         f"- Test iterations: {iterations}\n"
         f"- Plan phase: {plan_status}\n"
-        f"- Log: {log_dir}\n\n"
+        f"- Log: {log_dir}\n"
+        f"{note}\n"
         f"## Review\n\n{review.strip() or '(no review)'}\n\n"
         f"## Last test output\n\n```\n{shrink_text(test_output or '(tests did not run)', 8000)}\n```\n"
     )
@@ -357,9 +372,51 @@ def _plan_document(task: TaskSpec, plan: str) -> str:
     return f"# Plan: {task.title}\n\n{plan.strip()}\n"
 
 
+def ensure_repository(project: Path, *, init_repo: bool) -> str | None:
+    """Make sure `project` is a git repo.
+
+    With `init_repo`, a folder that is not a repository gets `git init` and an
+    empty initial commit. Returns a note when git has no user.name or
+    user.email, so the caller can show it. The note is None when identity is
+    already configured. Global git config is never written.
+    """
+
+    if not (project / ".git").exists():
+        if not init_repo:
+            raise RuntimeError(
+                f"{project} is not a git repository. "
+                "Pass --init-repo to `python -m local_agent overnight`, "
+                "or -InitRepo to scripts/overnight.ps1, "
+                "to create the repository and an empty initial commit."
+            )
+        project.mkdir(parents=True, exist_ok=True)
+        _git(project, "init", "-b", "main")
+        _commit_with_identity(project, "commit", "--allow-empty", "-m", "Initial commit")
+    return missing_identity_message(project)
+
+
+def missing_identity_message(project: Path) -> str | None:
+    missing = [key for key in ("user.name", "user.email") if not _config_get(project, key)]
+    if not missing:
+        return None
+    listed = " and ".join(missing)
+    return (
+        f"Git {listed} is not set. "
+        "This run will commit as Local Coding Agent <local-agent@localhost> "
+        "without changing your git config. "
+        'To use your own name: git config --global user.name "Your Name" '
+        'and git config --global user.email "you@example.com".'
+    )
+
+
 def _require_clean_git(project: Path) -> None:
     if not (project / ".git").exists():
-        raise RuntimeError(f"{project} is not a git repository. Initialize it before an overnight run.")
+        raise RuntimeError(
+            f"{project} is not a git repository. "
+            "Pass --init-repo to `python -m local_agent overnight`, "
+            "or -InitRepo to scripts/overnight.ps1, "
+            "to create the repository and an empty initial commit."
+        )
     status = _git(project, "status", "--porcelain")
     if status.strip():
         raise RuntimeError(
@@ -380,24 +437,133 @@ def _commit(project: Path, title: str, status: str) -> str | None:
     if not staged.strip():
         return None
     message = f"agent: {title} ({status})"
-    identity = _git_identity_args(project)
-    _git(project, *identity, "commit", "-m", message)
+    _commit_with_identity(project, "commit", "-m", message)
     return _git(project, "rev-parse", "--short", "HEAD").strip()
 
 
+def _commit_with_identity(project: Path, *args: str) -> str:
+    """Commit even when user.name or user.email is unset.
+
+    The fallback is a one-shot `git -c` and does not write git config.
+    A rejection still says how to set the identity, instead of only pasting
+    git's "please tell me who you are" text.
+    """
+
+    try:
+        return _git(project, *_git_identity_args(project), *args)
+    except RuntimeError as exc:
+        text = str(exc)
+        lowered = text.lower()
+        if "user.email" in lowered or "user.name" in lowered or "identity unknown" in lowered:
+            raise RuntimeError(
+                "Git could not commit because user.name or user.email is missing, "
+                "and the fallback identity was not accepted.\n"
+                'Set them with: git config --global user.name "Your Name"\n'
+                'and git config --global user.email "you@example.com".\n'
+                f"{text}"
+            ) from exc
+        raise
+
+
 def _git_identity_args(project: Path) -> list[str]:
-    email = _git(project, "config", "user.email", check=False).strip()
-    name = _git(project, "config", "user.name", check=False).strip()
     args: list[str] = []
-    if not name:
+    if not _config_get(project, "user.name"):
         args.extend(["-c", "user.name=Local Coding Agent"])
-    if not email:
+    if not _config_get(project, "user.email"):
         args.extend(["-c", "user.email=local-agent@localhost"])
     return args
 
 
-def _diff(project: Path) -> str:
-    return _git(project, "diff", "--stat") + "\n\n" + _git(project, "diff")
+def _config_get(project: Path, key: str) -> str:
+    result = subprocess.run(
+        ["git", "config", "--get", key],
+        cwd=project,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
+# Cap one new file so a generated log cannot push every other file out of the
+# review prompt. The whole diff is capped again before it is sent.
+_NEW_FILE_CHARS = 12_000
+
+
+def working_tree_diff(project: Path) -> str:
+    """Full change set against HEAD, including files git has never tracked.
+
+    `git diff` and `git diff HEAD` only describe tracked files. A run that
+    starts from an empty commit and creates textstats.py leaves those files
+    untracked until the final `git add`, so a review that only ran `git diff`
+    told the model the diff was missing.
+    """
+
+    tracked_stat = ""
+    tracked_patch = ""
+    if _head_exists(project):
+        tracked_stat = _git(project, "diff", "HEAD", "--stat").strip()
+        tracked_patch = _git(project, "diff", "HEAD").strip()
+    untracked = [
+        line.strip()
+        for line in _git(project, "ls-files", "--others", "--exclude-standard").splitlines()
+        if line.strip()
+    ]
+    if not tracked_stat and not tracked_patch and not untracked:
+        return "(no changes relative to HEAD)\n"
+    parts = ["# Changes since HEAD", ""]
+    if tracked_stat:
+        parts.append(tracked_stat)
+    if untracked:
+        parts.append("Untracked files (new):")
+        parts.extend(f"  {name}" for name in untracked)
+    parts.extend(["", "# Patch", ""])
+    if tracked_patch:
+        parts.append(tracked_patch)
+        parts.append("")
+    for rel in untracked:
+        parts.append(_new_file_patch(project, rel).rstrip())
+        parts.append("")
+    return "\n".join(parts).strip() + "\n"
+
+
+def _head_exists(project: Path) -> bool:
+    result = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", "HEAD"],
+        cwd=project,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def _new_file_patch(project: Path, rel: str) -> str:
+    path = project / rel
+    header = f"diff --git a/{rel} b/{rel}\nnew file mode 100644\n--- /dev/null\n+++ b/{rel}\n"
+    if not path.is_file():
+        return header + "(not a regular file)\n"
+    size = path.stat().st_size
+    if size > 1_000_000:
+        return header + f"(new file, {size} bytes, contents omitted)\n"
+    data = path.read_bytes()
+    if b"\0" in data[:8192]:
+        return header + f"Binary file {rel} added ({size} bytes)\n"
+    text = data.decode("utf-8", errors="replace").replace("\r\n", "\n")
+    truncated = ""
+    if len(text) > _NEW_FILE_CHARS:
+        text = text[:_NEW_FILE_CHARS]
+        truncated = "\\ [truncated]\n"
+    lines = text.split("\n")
+    if text.endswith("\n"):
+        lines = lines[:-1]
+    if not lines:
+        return header + "@@ -0,0 +0,0 @@\n(empty file)\n"
+    body = "".join(f"+{line}\n" for line in lines)
+    return header + f"@@ -0,0 +1,{len(lines)} @@\n" + body + truncated
 
 
 def _status_short(project: Path) -> str:

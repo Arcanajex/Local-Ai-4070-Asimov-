@@ -10,12 +10,20 @@
   already healthy. The model does not commit; the runner does, on a new
   branch in the target project.
 
-  The target project must be a clean git repository. Results land in
-  AGENT_PLAN.md, AGENT_REPORT.md, and a git commit. Logs go to
-  runtime\logs\overnight-*.log plus the JSONL written by the runner.
+  The target project must be a clean git repository. Pass -InitRepo when the
+  folder is not a repository yet: that runs git init and an empty initial
+  commit. Results land in AGENT_PLAN.md, AGENT_REPORT.md, and a git commit.
+  Logs go to runtime\logs\overnight-*.log plus the JSONL written by the runner.
 
 .EXAMPLE
   .\scripts\overnight.ps1 -Task .\tasks\smoke-task.md -Project C:\src\my-app -Profile quality
+
+.EXAMPLE
+  .\scripts\overnight.ps1 -Task .\TASK.md -Project C:\src\new-app -InitRepo
+
+.PARAMETER InitRepo
+  Create the project folder if needed, then git init and an empty initial
+  commit, when the folder is not already a repository.
 
 .PARAMETER MaxHours
   Wall-clock budget for the whole run. Default 8.
@@ -35,7 +43,8 @@ param(
     [int]$Port = 8080,
     [switch]$NoStayAwake,
     [switch]$SkipPerformancePlan,
-    [switch]$NoStartServer
+    [switch]$NoStartServer,
+    [switch]$InitRepo
 )
 
 $ErrorActionPreference = 'Stop'
@@ -47,6 +56,12 @@ $InstallDir = Get-InstallDir $InstallDir
 $python = Get-VenvPython $InstallDir
 
 $taskPath = (Resolve-Path -LiteralPath $Task).Path
+if (-not (Test-Path -LiteralPath $Project)) {
+    if (-not $InitRepo) {
+        throw "Project folder does not exist: $Project. Create it, or pass -InitRepo."
+    }
+    New-Item -ItemType Directory -Force -Path $Project | Out-Null
+}
 $projectPath = (Resolve-Path -LiteralPath $Project).Path
 
 $logDir = Join-Path $InstallDir 'logs'
@@ -114,14 +129,20 @@ try {
         }
     }
 
-    & $python -m local_agent overnight `
-        --task $taskPath `
-        --project $projectPath `
-        --profile $Profile `
-        --base-url $base `
-        --max-hours $MaxHours `
-        --max-iterations $MaxIterations `
-        --log-dir (Join-Path $logDir ('run-{0}' -f (Get-Date -Format 'yyyyMMdd-HHmmss')))
+    $agentArgs = @(
+        '-m', 'local_agent', 'overnight',
+        '--task', $taskPath,
+        '--project', $projectPath,
+        '--profile', $Profile,
+        '--base-url', $base,
+        '--max-hours', "$MaxHours",
+        '--max-iterations', "$MaxIterations",
+        '--log-dir', (Join-Path $logDir ('run-{0}' -f (Get-Date -Format 'yyyyMMdd-HHmmss')))
+    )
+    if ($InitRepo) {
+        $agentArgs += '--init-repo'
+    }
+    & $python @agentArgs
     $code = $LASTEXITCODE
 } finally {
     try { Stop-Transcript | Out-Null } catch { }

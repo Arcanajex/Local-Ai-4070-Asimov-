@@ -240,7 +240,7 @@ The server log in that window is the place to look when a load fails. The harnes
 
 What it does:
 
-1. Refuses to start unless `Project` is a git repo with a clean work tree.
+1. Refuses to start unless `Project` is a git repo with a clean work tree. Pass `-InitRepo` when the folder is not a repository yet. That creates the folder if needed, runs `git init`, and makes an empty initial commit. The same flag on the Python CLI is `--init-repo`.
 2. Suspends sleep for the life of the script (`SetThreadExecutionState`). The screen can still turn off.
 3. Switches Windows to the High performance power scheme and restores the previous scheme at the end. This does not change Legion Vantage's thermal mode; set that yourself (below).
 4. Starts `llama-server` if `/health` is down, and waits up to 20 minutes.
@@ -248,8 +248,8 @@ What it does:
 6. **Plan.** The model may read files. Its plan is saved as `AGENT_PLAN.md`.
 7. **Implement.** Read, write, edit, and shell, up to 30 turns.
 8. **Test.** The runner executes the task's `test_command` (default `python -m pytest -q`). On failure it starts a fresh conversation with the failure output and `git status`, and the model edits again. That repeat stops when tests pass, when `-MaxIterations` is hit (default 6), or when `-MaxHours` is hit (default 8). A fresh conversation per failure is deliberate: continuing one transcript is how the bench hit the context limit in the middle of a debug loop.
-9. **Review.** One call, no tools, with the diff. The model answers Correctness / Tests / Risks / Verdict.
-10. Writes `AGENT_REPORT.md` and commits it with the code. The committer name stays yours when `git config user.name` is set. A repo with no identity gets a one-shot `Local Coding Agent <local-agent@localhost>` for that commit only; your global git config is not changed.
+9. **Review.** One call, no tools, with the full change set. New files are included. `git diff` by itself hides them until they are staged, which is what produced an empty review on a repo whose only commit was empty. The model answers Correctness / Tests / Risks / Verdict.
+10. Writes `AGENT_REPORT.md` and commits it with the code. The committer name stays yours when `git config user.name` and `user.email` are set. If either is missing, the run still commits, prints a message that says so, and uses a one-shot `Local Coding Agent <local-agent@localhost>` for that commit only. Your git config is not changed.
 
 The task file can set the commands in front matter:
 
@@ -341,7 +341,9 @@ Prefill on a long agent prompt is slower than the decode number. The generation 
 
 **Download stopped at a few GB.** Run the same `setup.ps1` or `download-models.ps1` command again. The partial file is resumed. A size mismatch at the end means the file is still short; resume rather than deleting it.
 
-**`git commit` failed or the report says the repo was dirty.** Commit or stash your own work first. The runner will not mix its branch with uncommitted files. If `user.email` is unset, the commit still happens with a local one-shot identity.
+**`is not a git repository`.** The project folder has no `.git` directory. Re-run with `-InitRepo` (`--init-repo` on the Python CLI) to create the repository and an empty initial commit, or run `git init` yourself. A folder that already has files is still refused after that until those files are committed or moved aside, so the agent does not mix its branch with existing work.
+
+**`git commit` failed or the report says the repo was dirty.** Commit or stash your own work first. The runner will not mix its branch with uncommitted files. If `user.name` or `user.email` is unset, the transcript and `AGENT_REPORT.md` say that the commit used `Local Coding Agent <local-agent@localhost>` and did not change git config. Set the identity with `git config --global user.name` and `git config --global user.email` when you want the commits under your name.
 
 **Tests still fail right after a successful edit, and the traceback shows the old code.** Python records `.pyc` timestamps in whole seconds. A test run and an edit in the same second can leave pytest executing the previous bytecode. The edit and write tools delete that file's `__pycache__` entry, and the runner clears project bytecode before each test command. If you run pytest yourself in the same second, delete `__pycache__` or set `PYTHONDONTWRITEBYTECODE=1`.
 
