@@ -65,6 +65,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="If the project is not a git repository, git init and create an empty initial commit.",
     )
+    overnight.add_argument(
+        "--no-strict",
+        action="store_true",
+        help="Run a task that does not match docs/TASK_TEMPLATE.md.",
+    )
+    overnight.add_argument("--context-char-limit", type=int, default=14_000)
     overnight.set_defaults(func=_overnight)
 
     queue = sub.add_parser("queue", help="Run a folder of task files, one at a time.")
@@ -85,7 +91,23 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Run later task files even when one fails. The failed branch is not merged.",
     )
+    queue.add_argument(
+        "--no-strict",
+        action="store_true",
+        help="Run task files that do not match docs/TASK_TEMPLATE.md.",
+    )
+    queue.add_argument(
+        "--allow-main",
+        action="store_true",
+        help="Allow the queue to merge into main or master. Prefer an integration branch.",
+    )
     queue.set_defaults(func=_queue)
+
+    validate = sub.add_parser("validate", help="Check a task file or a task folder against the template.")
+    validate.add_argument("target", type=Path)
+    validate.add_argument("--project", type=Path, help="Repo the tasks apply to. Defaults to the task's folder.")
+    validate.add_argument("--no-strict", action="store_true")
+    validate.set_defaults(func=_validate)
 
     tune = sub.add_parser("tune", help="Sweep offload values and write runtime/overrides.json.")
     tune.add_argument("--profile", required=True)
@@ -166,6 +188,8 @@ def _overnight(args: argparse.Namespace) -> int:
         test_command=args.test_command,
         lint_command=args.lint_command,
         init_repo=args.init_repo,
+        strict=not args.no_strict,
+        context_char_limit=args.context_char_limit,
     )
     print(
         json.dumps(
@@ -196,6 +220,8 @@ def _queue(args: argparse.Namespace) -> int:
         max_iterations=args.max_iterations,
         init_repo=args.init_repo,
         continue_on_failure=args.continue_on_failure,
+        strict=not args.no_strict,
+        allow_main=args.allow_main,
     )
     print(
         json.dumps(
@@ -212,6 +238,22 @@ def _queue(args: argparse.Namespace) -> int:
         )
     )
     return 0 if result.status == "passed" else 1
+
+
+def _validate(args: argparse.Namespace) -> int:
+    from local_agent.taskcheck import collect_task_paths, format_problems, validate_task_files
+
+    paths = collect_task_paths(args.target)
+    project = args.project or (args.target if args.target.is_dir() else args.target.parent)
+    if args.no_strict:
+        print(f"ok ({len(paths)} file(s), strict checks skipped)")
+        return 0
+    problems = validate_task_files(paths, project)
+    if problems:
+        print(format_problems(problems), file=sys.stderr)
+        return 1
+    print(f"ok ({len(paths)} file(s))")
+    return 0
 
 
 def _tune(args: argparse.Namespace) -> int:

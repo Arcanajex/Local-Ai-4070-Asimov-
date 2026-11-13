@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -109,6 +110,16 @@ def pending_tasks(task_dir: Path, state: dict[str, Any]) -> tuple[list[Path], li
     skipped = [name for name in passed]
     pending = [path for path in list_task_files(task_dir) if path.name not in passed]
     return pending, skipped
+
+
+def _refuse_protected_branch(branch: str, *, allow_main: bool) -> None:
+    if branch.lower() not in {"main", "master"} or allow_main:
+        return
+    raise RuntimeError(
+        f"The queue would merge into {branch}. Use an integration branch so a batch "
+        f"does not land on {branch} directly. Check out that branch, or pass --allow-main "
+        f"(scripts/queue.ps1 -AllowMain) to merge into {branch} anyway."
+    )
 
 
 def current_branch(project: Path) -> str:
@@ -212,6 +223,8 @@ def run_queue(
     max_iterations: int = 6,
     init_repo: bool = False,
     continue_on_failure: bool = False,
+    strict: bool = True,
+    allow_main: bool = False,
     run_task: RunTask | None = None,
 ) -> QueueResult:
     task_dir = Path(task_dir).resolve()
@@ -224,12 +237,27 @@ def run_queue(
     state_path = task_dir / STATE_NAME
     summary_path = task_dir / SUMMARY_NAME
     state = load_state(state_path)
-    base_branch = str(state.get("base_branch") or "") or current_branch(project)
+    starting_branch = current_branch(project)
+    base_branch = str(state.get("base_branch") or "") or starting_branch
+    _refuse_protected_branch(starting_branch, allow_main=allow_main)
+    _refuse_protected_branch(base_branch, allow_main=allow_main)
+    if allow_main and base_branch.lower() in {"main", "master"}:
+        print(
+            f"warning: this queue will merge into {base_branch}. "
+            "An integration branch keeps a batch off the default branch.",
+            file=sys.stderr,
+        )
     state["base_branch"] = base_branch
     state["project"] = str(project)
     state["profile"] = profile.name
 
     pending, skipped_names = pending_tasks(task_dir, state)
+    if strict:
+        from local_agent.taskcheck import format_problems, validate_task_files
+
+        problems = validate_task_files(list_task_files(task_dir), project)
+        if problems:
+            raise RuntimeError(format_problems(problems))
     if not pending and not state["tasks"]:
         raise RuntimeError(
             f"No task markdown files in {task_dir}. "
@@ -272,6 +300,7 @@ def run_queue(
                 max_seconds=max_seconds_per_task,
                 max_iterations=max_iterations,
                 init_repo=False,
+                strict=strict,
             )
         except Exception as exc:
             duration = time.perf_counter() - started
@@ -298,7 +327,7 @@ def run_queue(
             continue
 
         duration = time.perf_counter() - started
-        if result.tests_passed:
+        if result.tests_passed and result.review_passed:
             try:
                 merge_commit = merge_no_ff(project, base_branch, result.branch) if result.branch else ""
             except Exception as exc:
@@ -346,7 +375,7 @@ def run_queue(
             merge_commit=None,
             iterations=result.iterations,
             duration=duration,
-            detail="tests did not pass",
+            detail="tests did not pass" if not result.tests_passed else "review rejected the change",
             stored_at=str(moved),
         )
         if not continue_on_failure:

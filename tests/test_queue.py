@@ -67,7 +67,7 @@ def test_merge_on_pass_then_resume_and_summary(tmp_path):
     assert (task_dir / "done" / "01-runner.md").is_file()
     assert (task_dir / "done" / "02-status.md").is_file()
     assert not (task_dir / "01-runner.md").exists()
-    assert _branch(project) == "main"
+    assert _branch(project) == "integration"
     assert (project / "01-runner.marker").read_text(encoding="utf-8") == "01-runner.md\n"
     assert (project / "02-status.marker").is_file()
     assert _is_merge_commit(project)
@@ -122,7 +122,7 @@ def test_stop_on_failure_does_not_start_later_tasks(tmp_path):
     assert (task_dir / "failed" / "02-status.md").is_file()
     assert (project / "01-runner.marker").is_file()
     assert not (project / "02-status.marker").exists()
-    assert _branch(project) == "main"
+    assert _branch(project) == "integration"
     summary = result.summary_path.read_text(encoding="utf-8")
     assert "Stopped on: 02-status.md" in summary
 
@@ -203,7 +203,7 @@ def test_passed_file_left_in_the_folder_is_not_run_again(tmp_path):
         task_dir / "queue-state.json",
         {
             "version": 1,
-            "base_branch": "main",
+            "base_branch": "integration",
             "tasks": {
                 "01-runner.md": {
                     "name": "01-runner.md",
@@ -245,7 +245,7 @@ def test_queue_rejects_an_empty_folder(tmp_path):
 
 
 def _runner(outcomes: dict[str, bool], calls: list[str], starts: list[tuple[str, str]]):
-    def run_task(*, task, project, profile, client, log_dir, max_seconds, max_iterations, init_repo):
+    def run_task(*, task, project, profile, client, log_dir, max_seconds, max_iterations, init_repo, **_extra):
         name = task.path.name
         calls.append(name)
         starts.append((name, _rev_parse(project)))
@@ -275,9 +275,9 @@ def _runner(outcomes: dict[str, bool], calls: list[str], starts: list[tuple[str,
     return run_task
 
 
-def _project(path: Path) -> Path:
+def _project(path: Path, branch: str = "integration") -> Path:
     path.mkdir(parents=True)
-    subprocess.run(["git", "init", "-b", "main"], cwd=path, check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(["git", "init", "-b", branch], cwd=path, check=True, stdout=subprocess.DEVNULL)
     subprocess.run(
         ["git", "-c", "user.name=Queue Test", "-c", "user.email=queue@example.com", "commit", "--allow-empty", "-m", "init"],
         cwd=path,
@@ -288,7 +288,13 @@ def _project(path: Path) -> Path:
 
 def _write_tasks(task_dir: Path, names: list[str]) -> None:
     for name in names:
-        (task_dir / name).write_text(f"# {name}\n\nDo the work.\n", encoding="utf-8")
+        (task_dir / name).write_text(
+            f"# {name}\n\n"
+            "## Goal\n\nDo the work.\n\n"
+            "## Acceptance criteria\n\n- [ ] marker file exists\n\n"
+            "## Out of scope\n\n- Do not edit unrelated files.\n",
+            encoding="utf-8",
+        )
 
 
 def _branch(project: Path) -> str:

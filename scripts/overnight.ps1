@@ -44,7 +44,8 @@ param(
     [switch]$NoStayAwake,
     [switch]$SkipPerformancePlan,
     [switch]$NoStartServer,
-    [switch]$InitRepo
+    [switch]$InitRepo,
+    [switch]$NoStrict
 )
 
 $ErrorActionPreference = 'Stop'
@@ -141,6 +142,9 @@ try {
     )
     if ($InitRepo) {
         $agentArgs += '--init-repo'
+    }
+    if ($NoStrict) {
+        $agentArgs += '--no-strict'
     }
     & $python @agentArgs
     $code = $LASTEXITCODE
