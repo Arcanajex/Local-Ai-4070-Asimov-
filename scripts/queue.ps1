@@ -39,6 +39,8 @@ param(
     [int]$Port = 8080,
     [switch]$InitRepo,
     [switch]$ContinueOnFailure,
+    [switch]$NoStrict,
+    [switch]$AllowMain,
     [switch]$NoStayAwake,
     [switch]$SkipPerformancePlan,
     [switch]$NoStartServer
@@ -195,6 +197,8 @@ try {
     )
     if ($InitRepo) { $agentArgs += '--init-repo' }
     if ($ContinueOnFailure) { $agentArgs += '--continue-on-failure' }
+    if ($NoStrict) { $agentArgs += '--no-strict' }
+    if ($AllowMain) { $agentArgs += '--allow-main' }
     $output = & $python @agentArgs
     $code = $LASTEXITCODE
     $parsed = ConvertTo-QueueResult -Output $output

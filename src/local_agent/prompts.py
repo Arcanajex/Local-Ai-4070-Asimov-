@@ -23,6 +23,8 @@ def system_prompt() -> str:
         "command's exit code was 0.\n"
         "Do not run git commit, git push, git reset --hard, or shutdown. "
         "A runner outside this chat commits and writes the report.\n"
+        "If the task is ambiguous, do not guess. End your reply with an "
+        "Open questions heading and list what is unresolved.\n"
         "When the task is done, stop calling tools and reply with a short summary."
     )
 
@@ -54,15 +56,48 @@ def fix_prompt(task: str, test_output: str, changed_files: str) -> str:
     )
 
 
-def review_prompt(task: str, diff: str, tests_ok: bool) -> str:
+def review_prompt(
+    task: str,
+    diff: str,
+    tests_ok: bool,
+    *,
+    acceptance: str = "",
+    out_of_scope: str = "",
+    context_block: str = "",
+) -> str:
     status = "The test command passed." if tests_ok else "The test command did not pass."
+    context = (context_block.rstrip() + "\n\n") if context_block.strip() else ""
     return (
-        "Review the diff. Do not call tools. Reply with these sections:\n"
+        f"{context}"
+        "Review the diff against the task and the project context. Do not call tools.\n"
+        "Reply with these sections and these exact headings:\n"
+        "Acceptance criteria:\n"
+        "one line per criterion, each ending in met or not met.\n"
+        "Out-of-scope files touched:\n"
+        "paths that this change edited outside the task, or none.\n"
+        "Conflicts with AGENTS.md or decisions:\n"
+        "each conflict, or none.\n"
         "Correctness: what the change does and whether it matches the task.\n"
         "Tests: what was verified and what was not.\n"
         "Risks: concrete leftover bugs or edge cases.\n"
-        "Verdict: accept or fix. Use 'fix' only for a defect you can point at in the diff.\n\n"
-        f"{status}\n\nTASK:\n{task}\n\n"
-        "DIFF (every changed and new file; new files are shown in full):\n"
+        "Verdict: accept or fix. Use fix only for a defect you can point at in the diff.\n"
+        "Open questions: unresolved ambiguities, or none. Do not guess.\n\n"
+        f"{status}\n\n"
+        f"ACCEPTANCE CRITERIA FROM THE TASK:\n{acceptance or '(none listed)'}\n\n"
+        f"OUT OF SCOPE FROM THE TASK:\n{out_of_scope or '(none listed)'}\n\n"
+        f"TASK:\n{task}\n\n"
+        "DIFF (file list first, then as much of the patch as fits):\n"
         f"{diff}"
+    )
+
+
+def review_fix_prompt(task: str, review: str, changed_files: str) -> str:
+    return (
+        "The self-review rejected the change. Fix the code so every acceptance "
+        "criterion is met and every conflict is resolved. Do not expand work "
+        "the task marks out of scope. If something is still ambiguous, list it "
+        "under Open questions instead of guessing.\n\n"
+        f"Review:\n{review}\n\n"
+        f"Changed files:\n{changed_files or '(none)'}\n\n"
+        f"TASK:\n{task}"
     )

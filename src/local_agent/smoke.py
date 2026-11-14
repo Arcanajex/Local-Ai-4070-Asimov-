@@ -24,10 +24,18 @@ from local_agent.paths import repo_root
 ADDER_BUG = "def add(a, b):\n    return a - b\n"
 ADDER_TEST = "from adder import add\n\n\ndef test_add():\n    assert add(2, 3) == 5\n"
 REVIEW = (
+    "Acceptance criteria:\n"
+    "- add(2, 3) returns 5: met\n"
+    "Out-of-scope files touched:\n"
+    "none\n"
+    "Conflicts with AGENTS.md or decisions:\n"
+    "none\n"
     "Correctness: add returns the sum of its arguments.\n"
     "Tests: test_add covers 2 + 3.\n"
     "Risks: non-numeric inputs are not handled.\n"
     "Verdict: accept\n"
+    "Open questions:\n"
+    "none\n"
 )
 
 
@@ -41,16 +49,12 @@ class ScriptedSmokeClient:
 
     def chat(self, messages, *, tools, max_tokens):  # noqa: ANN001 - matches ChatClient.chat
         prompt = _first_user(messages)
-        if "write a numbered plan" in prompt:
+        # Context is prepended, so the phase instruction is not always at column 0.
+        if "Do not edit files and do not run commands in this phase" in prompt:
             return _text("1. Add adder.py with add(a, b).\n2. Add test_adder.py.\n3. Run pytest.")
-        if prompt.startswith("Implement the task"):
-            self.implement_calls += 1
-            if self.implement_calls == 1:
-                return _call("write", {"path": "adder.py", "content": ADDER_BUG})
-            if self.implement_calls == 2:
-                return _call("write", {"path": "test_adder.py", "content": ADDER_TEST})
-            return _text("Implemented adder.py and test_adder.py.")
-        if prompt.startswith("The tests failed"):
+        if "The self-review rejected" in prompt:
+            return _text("Adjusted the change to match the review.")
+        if "The tests failed" in prompt:
             self.fix_calls += 1
             if self.fix_calls == 1:
                 return _call(
@@ -62,7 +66,14 @@ class ScriptedSmokeClient:
                     },
                 )
             return _text("Fixed add to return a sum.")
-        if prompt.startswith("Review the diff"):
+        if "Implement the task." in prompt:
+            self.implement_calls += 1
+            if self.implement_calls == 1:
+                return _call("write", {"path": "adder.py", "content": ADDER_BUG})
+            if self.implement_calls == 2:
+                return _call("write", {"path": "test_adder.py", "content": ADDER_TEST})
+            return _text("Implemented adder.py and test_adder.py.")
+        if "Review the diff" in prompt:
             return _text(REVIEW)
         return _text("Nothing to do.")
 

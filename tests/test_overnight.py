@@ -33,7 +33,7 @@ def test_mock_smoke_fixes_a_bug_and_commits():
     assert result.status == "passed"
     assert result.commit
     assert result.branch.startswith("agent/smoke-task-adder-")
-    project = result.report_path.parent
+    project = result.report_path.parent.parent
     adder = (project / "adder.py").read_text(encoding="utf-8")
     assert "return a + b" in adder
     assert "return a - b" not in adder
@@ -54,8 +54,13 @@ def test_mock_smoke_fixes_a_bug_and_commits():
     files = subprocess.check_output(
         ["git", "ls-tree", "-r", "--name-only", "HEAD"], cwd=project, text=True
     )
-    for name in ("adder.py", "test_adder.py", "AGENT_PLAN.md", "AGENT_REPORT.md"):
+    for name in ("adder.py", "test_adder.py"):
         assert name in files
+    assert "AGENT_PLAN.md" not in files
+    assert "AGENT_REPORT.md" not in files
+    assert ".agent/AGENT_REPORT.md" not in files
+    assert result.report_path == project / ".agent" / "AGENT_REPORT.md"
+    assert "Open questions" in report
     review_prompt = _review_request(log)
     # These files are created during the run and are still untracked when the
     # review prompt is built. `git diff` alone does not show them.

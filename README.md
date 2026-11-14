@@ -40,6 +40,8 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\scripts\overnight.ps1 -Task .\tasks\smoke-task.md -Project C:\src\my-app -Profile quality
 
 # A folder of ordered tasks, unattended. Passing branches merge back into the project branch.
+# Check out an integration branch in the target repo first (not main, unless you pass -AllowMain).
+python -m local_agent validate C:\src\my-app\tasks --project C:\src\my-app
 .\scripts\queue.ps1 -TaskDir C:\src\my-app\tasks -Project C:\src\my-app -Profile quality
 ```
 
@@ -275,6 +277,24 @@ Logs:
 
 - `runtime\logs\overnight-*.log` is the PowerShell transcript.
 - `runtime\logs\run-*\events.jsonl` is every model turn.
+
+## Project context and the task template
+
+The target repo should have an `AGENTS.md` at its root. That file, plus any paths named in a task's `context:` front matter, is inlined as a **Project context** block at the start of every phase (plan, implement, fix, review). The block is capped at 14,000 characters. When a file is cut, the block says `[truncated - read <path> for the rest]` and still lists every path so the model can read the remainder. Compaction keeps the first user message, so this block is not dropped when tool output is trimmed.
+
+Write tasks with [docs/TASK_TEMPLATE.md](docs/TASK_TEMPLATE.md). Required headings are `Goal`, `Acceptance criteria`, and `Out of scope`. A non-Python repo must set `test_command`. A Python repo that omits it uses `python -m pytest -q`.
+
+```powershell
+python -m local_agent validate C:\src\my-app\tasks --project C:\src\my-app
+```
+
+The queue checks every task file before the first one starts and refuses with the full list of problems. `-NoStrict` (`--no-strict`) runs older files, including `tasks/ui/*`, that predate the template.
+
+The self-review must answer `Acceptance criteria` (each line `met` or `not met`), `Out-of-scope files touched`, and `Conflicts with AGENTS.md or decisions`. A `not met` line or a conflict runs one fix iteration and a second review. The diff in that prompt starts with the file list. If the patch does not fit, the prompt names the files that were left out.
+
+`AGENT_PLAN.md` and `AGENT_REPORT.md` are written to `<project>\.agent\`. The runner adds `.agent/` to `.git\info\exclude`, which is local to the clone and is not `.gitignore`, so `git add -A` does not commit them. The report includes an `Open questions` section. The result JSON still has the report path.
+
+Run a queue on an integration branch, not on `main`. Starting on `main` or `master` stops unless you pass `-AllowMain` (`--allow-main`), which also prints a warning.
 
 ## Task queue
 

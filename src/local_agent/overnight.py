@@ -14,7 +14,7 @@ import re
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -24,11 +24,25 @@ from local_agent.config import Profile, get_profile
 from local_agent.context import shrink_text
 from local_agent.harness import AgentHarness, PhaseResult
 from local_agent.logging_util import RunLogger
-from local_agent.prompts import fix_prompt, implement_prompt, plan_prompt, review_prompt
+from local_agent.project_context import (
+    DEFAULT_CONTEXT_CHARS,
+    build_project_context,
+    shrink_context_to_budget,
+    with_project_context,
+)
+from local_agent.prompts import (
+    fix_prompt,
+    implement_prompt,
+    plan_prompt,
+    review_fix_prompt,
+    review_prompt,
+)
+from local_agent.taskcheck import extract_section, format_problems, review_problems, validate_task
 from local_agent.tools import Workspace, clear_bytecode, run_command
 
 PLAN_FILE = "AGENT_PLAN.md"
 REPORT_FILE = "AGENT_REPORT.md"
+AGENT_DIR_NAME = ".agent"
 _FRONT_MATTER = re.compile(r"\A---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 
 
@@ -39,6 +53,8 @@ class TaskSpec:
     test_command: str
     lint_command: str | None
     path: Path | None = None
+    test_command_explicit: bool = False
+    context_paths: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -50,12 +66,14 @@ class OvernightResult:
     iterations: int
     tests_passed: bool
     log_dir: Path
+    review_passed: bool = True
 
 
 def parse_task(text: str, path: Path | None = None) -> TaskSpec:
-    meta, body = _split_front_matter(text)
+    meta, context_paths, body = _split_front_matter(text)
     title = _title(body) or (path.stem if path else "task")
-    test_command = str(meta.get("test_command") or "python -m pytest -q")
+    explicit = "test_command" in meta
+    test_command = str(meta["test_command"]) if explicit else "python -m pytest -q"
     lint_raw = meta.get("lint_command")
     lint_command = str(lint_raw) if lint_raw else None
     return TaskSpec(
@@ -64,6 +82,8 @@ def parse_task(text: str, path: Path | None = None) -> TaskSpec:
         test_command=test_command,
         lint_command=lint_command,
         path=path,
+        test_command_explicit=explicit,
+        context_paths=context_paths,
     )
 
 
@@ -71,19 +91,46 @@ def load_task(path: Path) -> TaskSpec:
     return parse_task(Path(path).read_text(encoding="utf-8"), Path(path))
 
 
-def _split_front_matter(text: str) -> tuple[dict[str, str], str]:
+def _split_front_matter(text: str) -> tuple[dict[str, str], list[str], str]:
     match = _FRONT_MATTER.match(text)
     if not match:
-        return {}, text
+        return {}, [], text
+    meta, context_paths = _parse_front_matter(match.group(1))
+    return meta, context_paths, text[match.end() :]
+
+
+def _parse_front_matter(block: str) -> tuple[dict[str, str], list[str]]:
+    """Line-oriented front matter, including a `context` list."""
+
     meta: dict[str, str] = {}
-    for line in match.group(1).splitlines():
+    context: list[str] = []
+    lines = block.splitlines()
+    index = 0
+    while index < len(lines):
+        line = lines[index]
         if not line.strip() or line.strip().startswith("#"):
+            index += 1
             continue
         if ":" not in line:
+            index += 1
             continue
         key, value = line.split(":", 1)
-        meta[key.strip()] = value.strip().strip('"').strip("'")
-    return meta, text[match.end() :]
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key == "context" and not value:
+            index += 1
+            while index < len(lines) and lines[index].lstrip().startswith("- "):
+                item = lines[index].lstrip()[2:].strip().strip('"').strip("'")
+                if item:
+                    context.append(item)
+                index += 1
+            continue
+        if key == "context":
+            context.extend(part.strip() for part in value.split(",") if part.strip())
+        else:
+            meta[key] = value
+        index += 1
+    return meta, context
 
 
 def _title(body: str) -> str:
@@ -113,6 +160,8 @@ def run_overnight(
     test_command: str | None = None,
     lint_command: str | None = None,
     init_repo: bool = False,
+    strict: bool = True,
+    context_char_limit: int = DEFAULT_CONTEXT_CHARS,
 ) -> OvernightResult:
     project = Path(project).resolve()
     logger = RunLogger(log_dir)
@@ -126,19 +175,37 @@ def run_overnight(
     test_output = ""
     plan_status = "not_started"
     identity_note = ""
+    review_passed = True
+    context_block = ""
     try:
         identity_note = ensure_repository(project, init_repo=init_repo) or ""
         if identity_note:
             logger.event("git_identity", summary=identity_note)
             print(identity_note, file=sys.stderr)
         _require_clean_git(project)
+        exclude_agent_dir(project)
+        if strict:
+            problems = validate_task(task, project)
+            if problems:
+                raise RuntimeError(format_problems(problems))
         workspace = Workspace(project)
+        context_block = shrink_context_to_budget(
+            build_project_context(project, task.context_paths, limit=context_char_limit),
+            context_tokens=profile.context,
+            generation_tokens=profile.agent_max_tokens_ceiling,
+        )
+        logger.event(
+            "project_context",
+            chars=len(context_block),
+            paths=["AGENTS.md", *task.context_paths],
+            summary=f"project context {len(context_block)} chars",
+        )
         branch = _create_branch(project, slugify(task.title))
         logger.event("run_start", branch=branch, profile=profile.name, task=task.title, summary=branch)
 
         plan = _run_phase(
             client, workspace, logger, profile,
-            plan_prompt(task.body),
+            with_project_context(plan_prompt(task.body), context_block),
             allowed={"read"},
             max_turns=max_plan_turns,
             deadline=deadline,
@@ -146,7 +213,7 @@ def run_overnight(
         )
         plan_status = plan.status
         plan_text = plan.content.strip() or "(the model did not return a plan)"
-        (project / PLAN_FILE).write_text(_plan_document(task, plan_text), encoding="utf-8", newline="\n")
+        _write_agent_file(project, PLAN_FILE, _plan_document(task, plan_text))
 
         if time.monotonic() >= deadline:
             return _finish(
@@ -159,7 +226,7 @@ def run_overnight(
 
         implement = _run_phase(
             client, workspace, logger, profile,
-            implement_prompt(task.body, plan_text),
+            with_project_context(implement_prompt(task.body, plan_text), context_block),
             allowed=None,
             max_turns=max_work_turns,
             deadline=deadline,
@@ -192,7 +259,10 @@ def run_overnight(
                 break
             fix = _run_phase(
                 client, workspace, logger, profile,
-                fix_prompt(task.body, shrink_text(test_output, 12_000), _status_short(project)),
+                with_project_context(
+                    fix_prompt(task.body, shrink_text(test_output, 12_000), _status_short(project)),
+                    context_block,
+                ),
                 allowed=None,
                 max_turns=max_work_turns,
                 deadline=deadline,
@@ -217,18 +287,29 @@ def run_overnight(
             stop_status = "iteration_budget"
 
         review_text = ""
+        review_passed = False
         if time.monotonic() < deadline:
-            diff = shrink_text(working_tree_diff(project), 24_000)
-            review = _run_phase(
-                client, workspace, logger, profile,
-                review_prompt(task.body, diff, tests_passed),
-                allowed=set(),
-                max_turns=2,
+            review_text, review_passed, tests_passed, test_output, stop_status = _review_and_maybe_fix(
+                client=client,
+                workspace=workspace,
+                logger=logger,
+                profile=profile,
+                task=task,
+                context_block=context_block,
+                tests_passed=tests_passed,
+                test_output=test_output,
+                stop_status=stop_status,
                 deadline=deadline,
-                phase="review",
+                max_work_turns=max_work_turns,
+                test_command=test_cmd,
+                lint_command=lint_cmd,
             )
-            review_text = review.content.strip()
-        report_status = "passed" if tests_passed else stop_status
+        if tests_passed and review_passed:
+            report_status = "passed"
+        elif not tests_passed:
+            report_status = stop_status
+        else:
+            report_status = "review_failed"
         return _finish(
             project, logger, task, profile, branch, log_dir,
             status=report_status,
@@ -238,6 +319,8 @@ def run_overnight(
             review=review_text,
             plan_status=plan.status,
             identity_note=identity_note,
+            review_passed=review_passed,
+            open_questions=_open_questions(plan_text, review_text),
         )
     except Exception as exc:
         logger.event("run_error", summary=f"{type(exc).__name__}: {exc}")
@@ -258,6 +341,93 @@ def run_overnight(
         raise
     finally:
         logger.close()
+
+
+def _review_and_maybe_fix(
+    *,
+    client: ChatClient,
+    workspace: Workspace,
+    logger: RunLogger,
+    profile: Profile,
+    task: TaskSpec,
+    context_block: str,
+    tests_passed: bool,
+    test_output: str,
+    stop_status: str,
+    deadline: float,
+    max_work_turns: int,
+    test_command: str,
+    lint_command: str | None,
+) -> tuple[str, bool, bool, str, str]:
+    """Review once. A not-met criterion or a conflict gets one fix, then a re-review."""
+
+    review_text, problems = _one_review(
+        client, workspace, logger, profile, task, context_block, tests_passed, deadline, phase="review"
+    )
+    if not problems:
+        return review_text, True, tests_passed, test_output, stop_status
+    logger.event("review_rejected", summary="; ".join(problems)[:500], problems=problems)
+    if time.monotonic() >= deadline:
+        return review_text, False, tests_passed, test_output, stop_status
+    _run_phase(
+        client, workspace, logger, profile,
+        with_project_context(
+            review_fix_prompt(task.body, shrink_text(review_text, 12_000), _status_short(workspace.root)),
+            context_block,
+        ),
+        allowed=None,
+        max_turns=max_work_turns,
+        deadline=deadline,
+        phase="review-fix",
+    )
+    test_output, tests_passed = _run_checks(workspace.root, test_command, lint_command)
+    logger.event(
+        "tests",
+        iteration="review-fix",
+        passed=tests_passed,
+        output=test_output,
+        summary=f"after review fix passed={tests_passed}",
+    )
+    if not tests_passed:
+        return review_text, False, tests_passed, test_output, "tests_failed"
+    if time.monotonic() >= deadline:
+        return review_text, False, tests_passed, test_output, stop_status
+    review_text, problems = _one_review(
+        client, workspace, logger, profile, task, context_block, tests_passed, deadline, phase="review-again"
+    )
+    return review_text, not problems, tests_passed, test_output, stop_status
+
+
+def _one_review(
+    client: ChatClient,
+    workspace: Workspace,
+    logger: RunLogger,
+    profile: Profile,
+    task: TaskSpec,
+    context_block: str,
+    tests_passed: bool,
+    deadline: float,
+    *,
+    phase: str,
+) -> tuple[str, list[str]]:
+    diff = fit_review_diff(working_tree_diff(workspace.root), 24_000)
+    review = _run_phase(
+        client, workspace, logger, profile,
+        review_prompt(
+            task.body,
+            diff,
+            tests_passed,
+            acceptance=extract_section(task.body, "Acceptance criteria"),
+            out_of_scope=extract_section(task.body, "Out of scope"),
+            context_block=context_block,
+        ),
+        allowed=set(),
+        max_turns=2,
+        deadline=deadline,
+        phase=phase,
+    )
+    text = review.content.strip()
+    return text, review_problems(text)
 
 
 def _run_phase(
@@ -308,6 +478,8 @@ def _finish(
     review: str,
     plan_status: str,
     identity_note: str = "",
+    review_passed: bool = True,
+    open_questions: str = "",
 ) -> OvernightResult:
     report = _render_report(
         task=task,
@@ -321,9 +493,11 @@ def _finish(
         plan_status=plan_status,
         log_dir=log_dir,
         identity_note=identity_note,
+        open_questions=open_questions,
+        review_passed=review_passed,
     )
-    report_path = project / REPORT_FILE
-    report_path.write_text(report, encoding="utf-8", newline="\n")
+    exclude_agent_dir(project)
+    report_path = _write_agent_file(project, REPORT_FILE, report)
     commit = _commit(project, task.title, status)
     logger.event("run_end", status=status, commit=commit, summary=f"{status} commit={commit}")
     return OvernightResult(
@@ -334,6 +508,7 @@ def _finish(
         iterations=iterations,
         tests_passed=tests_passed,
         log_dir=log_dir,
+        review_passed=review_passed,
     )
 
 
@@ -350,12 +525,16 @@ def _render_report(
     plan_status: str,
     log_dir: Path,
     identity_note: str = "",
+    open_questions: str = "",
+    review_passed: bool = True,
 ) -> str:
     note = f"\n{identity_note}\n" if identity_note else ""
+    questions = open_questions.strip() or "(none recorded)"
     return (
         f"# Agent report\n\n"
         f"- Status: {status}\n"
         f"- Tests passed: {'yes' if tests_passed else 'no'}\n"
+        f"- Review passed: {'yes' if review_passed else 'no'}\n"
         f"- Profile: {profile_name}\n"
         f"- Task: {task.title}\n"
         f"- Branch: {branch}\n"
@@ -364,12 +543,111 @@ def _render_report(
         f"- Log: {log_dir}\n"
         f"{note}\n"
         f"## Review\n\n{review.strip() or '(no review)'}\n\n"
+        f"## Open questions\n\n{questions}\n\n"
         f"## Last test output\n\n```\n{shrink_text(test_output or '(tests did not run)', 8000)}\n```\n"
     )
 
 
 def _plan_document(task: TaskSpec, plan: str) -> str:
     return f"# Plan: {task.title}\n\n{plan.strip()}\n"
+
+
+def agent_dir(project: Path) -> Path:
+    return project / AGENT_DIR_NAME
+
+
+def exclude_agent_dir(project: Path) -> None:
+    """Keep `.agent/` out of commits via the repo-local exclude file.
+
+    `.git/info/exclude` is not a file in the user's tree, so this does not
+    edit `.gitignore` or any other committed file.
+    """
+
+    exclude = project / ".git" / "info" / "exclude"
+    if not exclude.parent.is_dir():
+        return
+    existing = exclude.read_text(encoding="utf-8") if exclude.is_file() else ""
+    lines = [line.strip() for line in existing.splitlines()]
+    if ".agent/" in lines or ".agent" in lines:
+        return
+    suffix = "" if existing.endswith("\n") or not existing else "\n"
+    exclude.write_text(existing + suffix + ".agent/\n", encoding="utf-8")
+
+
+def _write_agent_file(project: Path, name: str, text: str) -> Path:
+    exclude_agent_dir(project)
+    directory = agent_dir(project)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / name
+    path.write_text(text, encoding="utf-8", newline="\n")
+    return path
+
+
+def _open_questions(*texts: str) -> str:
+    chunks = []
+    for text in texts:
+        section = extract_section(text, "Open questions")
+        if section.strip():
+            chunks.append(section.strip())
+    return "\n\n".join(chunks)
+
+
+def fit_review_diff(diff_text: str, limit: int) -> str:
+    """Keep the file list, then as much patch as fits, and name what was cut.
+
+    A silent character trim used to drop the tail of the diff with no mention
+    of the files the model never saw.
+    """
+
+    if len(diff_text) <= limit:
+        return diff_text
+    marker = "\n# Patch\n"
+    if marker in diff_text:
+        stat, patch = diff_text.split(marker, 1)
+        stat = stat + marker
+    else:
+        stat, patch = "", diff_text
+    note_room = 400
+    budget = max(0, limit - len(stat) - note_room)
+    included, omitted = _take_diff_files(patch, budget)
+    note = ""
+    if omitted:
+        listed = "\n".join(f"- {name}" for name in omitted)
+        note = (
+            "\n\nFiles omitted from the patch (they are still in the file list above; "
+            f"read them in the repo):\n{listed}\n"
+        )
+    # Keep the omission note even when the patch budget was optimistic.
+    # Never cut the file list to make the note fit. A slightly long prompt is
+    # better than a review that cannot see which files changed.
+    return stat + included + note
+
+
+def _take_diff_files(patch: str, budget: int) -> tuple[str, list[str]]:
+    if not patch.strip():
+        return "", []
+    parts = re.split(r"(?=^diff --git )", patch, flags=re.M)
+    included: list[str] = []
+    omitted: list[str] = []
+    used = 0
+    for part in parts:
+        if not part.strip():
+            continue
+        name = _diff_file_name(part) or part.splitlines()[0][:120]
+        if used + len(part) <= budget:
+            included.append(part)
+            used += len(part)
+        else:
+            omitted.append(name)
+    return "".join(included), omitted
+
+
+def _diff_file_name(chunk: str) -> str:
+    match = re.search(r"^diff --git a/.+ b/(.+)$", chunk, flags=re.M)
+    if match:
+        return match.group(1).strip()
+    plus = re.search(r"^\+\+\+ b/(.+)$", chunk, flags=re.M)
+    return plus.group(1).strip() if plus else ""
 
 
 def ensure_repository(project: Path, *, init_repo: bool) -> str | None:
