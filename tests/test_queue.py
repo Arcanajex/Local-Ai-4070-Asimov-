@@ -3,6 +3,9 @@
 The overnight model is replaced with a fake that commits on a new branch.
 Merging those branches is real git, so a passing task is actually on the
 branch the next task starts from.
+
+These tests pass archive=False so they keep pinning the done/ and failed/
+layout. Archiving and the stop file are covered in test_archive_and_stop.py.
 """
 
 from __future__ import annotations
@@ -60,6 +63,7 @@ def test_merge_on_pass_then_resume_and_summary(tmp_path):
         profile=get_profile("day"),
         client=None,
         log_dir=tmp_path / "logs",
+        archive=False,
         run_task=_runner({"01-runner.md": True, "02-status.md": True}, calls, starts),
     )
     assert result.status == "passed"
@@ -90,6 +94,7 @@ def test_merge_on_pass_then_resume_and_summary(tmp_path):
         profile=get_profile("day"),
         client=None,
         log_dir=tmp_path / "logs",
+        archive=False,
         run_task=_runner({"03-window.md": True}, calls, starts),
     )
     assert again.skipped >= 2
@@ -109,6 +114,7 @@ def test_stop_on_failure_does_not_start_later_tasks(tmp_path):
         profile=get_profile("day"),
         client=None,
         log_dir=tmp_path / "logs",
+        archive=False,
         run_task=_runner(
             {"01-runner.md": True, "02-status.md": False, "03-window.md": True},
             calls,
@@ -140,6 +146,7 @@ def test_continue_on_failure_skips_the_failed_merge_and_runs_the_rest(tmp_path):
         profile=get_profile("day"),
         client=None,
         log_dir=tmp_path / "logs",
+        archive=False,
         continue_on_failure=True,
         run_task=_runner(
             {"01-runner.md": True, "02-status.md": False, "03-window.md": True},
@@ -223,6 +230,7 @@ def test_passed_file_left_in_the_folder_is_not_run_again(tmp_path):
         profile=get_profile("day"),
         client=None,
         log_dir=tmp_path / "logs",
+        archive=False,
         run_task=_runner({"02-status.md": True}, calls, []),
     )
     assert calls == ["02-status.md"]

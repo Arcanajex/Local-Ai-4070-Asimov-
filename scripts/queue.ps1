@@ -10,8 +10,19 @@
   was on, then the next file starts. A failure stops the queue unless
   -ContinueOnFailure is set.
 
-  Progress is queue-state.json in the task folder. Passed files move to
-  done\, failed files to failed\. Run the same command again to resume.
+  Progress is queue-state.json in the task folder. A passing file is moved
+  to tasks\archive in this repo, keeping the folder it lived in
+  (tasks\ui\step-2.md becomes tasks\archive\ui\step-2.md). A failing file
+  stays where it is. -NoArchive uses the older done\ and failed\ folders.
+  Run the same command again to resume.
+
+  Ctrl+C in this window is delivered to the Python process and aborts the
+  task that is running. It is not a graceful stop. From another window run
+  scripts\stop-queue.ps1. The queue finishes the current task, starts
+  nothing else, and exits 0. A second Ctrl+C is not special-cased: the
+  console interrupt is not reliable on both Windows PowerShell 5.1 and
+  PowerShell 7 when a child python.exe owns the console.
+
   When the queue ends, a toast and a beep fire. If Windows refuses the
   toast, the queue result is unchanged.
 
@@ -27,6 +38,18 @@
 
 .PARAMETER MaxHoursPerTask
   Wall-clock budget for each task. Default 8.
+
+.PARAMETER ArchiveDir
+  Folder passing task files are moved into. Default is tasks\archive in
+  this repo. The path under the tasks root is kept.
+
+.PARAMETER TasksRoot
+  Folder archive paths are relative to. Default is the tasks directory
+  that contains the queue (tasks\ui\step-2.md -> tasks\archive\ui\step-2.md).
+
+.PARAMETER NoArchive
+  Leave passing files in done\ and failing files in failed\, and do not
+  write to the archive.
 #>
 [CmdletBinding()]
 param(
@@ -34,6 +57,8 @@ param(
     [Parameter(Mandatory = $true)][string]$Project,
     [string]$Profile = 'quality',
     [string]$InstallDir = '',
+    [string]$ArchiveDir = '',
+    [string]$TasksRoot = '',
     [double]$MaxHoursPerTask = 8,
     [int]$MaxIterations = 6,
     [int]$Port = 8080,
@@ -41,6 +66,7 @@ param(
     [switch]$ContinueOnFailure,
     [switch]$NoStrict,
     [switch]$AllowMain,
+    [switch]$NoArchive,
     [switch]$NoStayAwake,
     [switch]$SkipPerformancePlan,
     [switch]$NoStartServer
@@ -111,6 +137,9 @@ function Show-QueueNotification {
 }
 
 Assert-NativeWindows
+if ($NoArchive -and $ArchiveDir) {
+    throw '-NoArchive and -ArchiveDir cannot be used together.'
+}
 $InstallDir = Get-InstallDir $InstallDir
 $python = Get-VenvPython $InstallDir
 
@@ -150,6 +179,7 @@ if (-not $NoStayAwake) {
 }
 
 $code = 1
+$parsed = $null
 $toastTitle = 'Queue ended'
 $toastBody = 'The queue stopped before it could report a result. See the log.'
 try {
@@ -199,11 +229,20 @@ try {
     if ($ContinueOnFailure) { $agentArgs += '--continue-on-failure' }
     if ($NoStrict) { $agentArgs += '--no-strict' }
     if ($AllowMain) { $agentArgs += '--allow-main' }
+    if ($NoArchive) { $agentArgs += '--no-archive' }
+    if ($ArchiveDir) { $agentArgs += @('--archive-dir', $ArchiveDir) }
+    if ($TasksRoot) { $agentArgs += @('--tasks-root', $TasksRoot) }
     $output = & $python @agentArgs
     $code = $LASTEXITCODE
     $parsed = ConvertTo-QueueResult -Output $output
     if ($null -ne $parsed) {
-        if ($parsed.status -eq 'passed') {
+        if ($parsed.status -eq 'stopped_on_request') {
+            $toastTitle = 'Queue stopped on request'
+            $toastBody = [string]$parsed.message
+            if (-not $toastBody) {
+                $toastBody = 'The current task finished. No new task was started.'
+            }
+        } elseif ($parsed.status -eq 'passed') {
             $toastTitle = 'Queue finished'
             $toastBody = "All tasks passed ($($parsed.passed) passed)."
         } elseif ($parsed.stopped_on) {
@@ -235,9 +274,18 @@ try {
     }
 }
 
+if ($null -ne $parsed -and $parsed.status -eq 'stopped_on_request') {
+    if ($parsed.message) {
+        Write-Host $parsed.message
+    } else {
+        Write-Host 'Stopped on request. The current task was allowed to finish. No new task was started.'
+    }
+    Write-Host 'See queue-summary.md in the task folder.'
+    exit 0
+}
 if ($code -ne 0) {
     Write-Host "Queue finished without every task passing (exit $code). See queue-summary.md in the task folder and $log."
     exit $code
 }
-Write-Host 'Queue passed. See queue-summary.md in the task folder.'
+Write-Host 'Queue passed. See queue-summary.md in the task folder. Passing tasks were archived under tasks\archive unless -NoArchive was set.'
 exit 0

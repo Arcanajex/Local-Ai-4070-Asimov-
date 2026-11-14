@@ -11,6 +11,8 @@ from local_agent import __version__
 from local_agent.client import server_is_healthy
 from local_agent.config import get_profile, list_profiles
 from local_agent.download import DownloadError, download_file
+from local_agent.archive import archive_task, maybe_archive_task
+from local_agent.control import cancel_stop, request_stop
 from local_agent.overnight import load_task, make_client, run_overnight
 from local_agent.queue import run_queue
 from local_agent.paths import runtime_dir
@@ -71,6 +73,21 @@ def main(argv: list[str] | None = None) -> int:
         help="Run a task that does not match docs/TASK_TEMPLATE.md.",
     )
     overnight.add_argument("--context-char-limit", type=int, default=14_000)
+    overnight.add_argument(
+        "--archive-dir",
+        type=Path,
+        help="Move the task file here when the run passes. Default: tasks/archive in this repo.",
+    )
+    overnight.add_argument(
+        "--tasks-root",
+        type=Path,
+        help="Folder the archive path is relative to. Default: the tasks directory that contains the file.",
+    )
+    overnight.add_argument(
+        "--no-archive",
+        action="store_true",
+        help="Leave the task file where it is after a passing run.",
+    )
     overnight.set_defaults(func=_overnight)
 
     queue = sub.add_parser("queue", help="Run a folder of task files, one at a time.")
@@ -101,7 +118,54 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Allow the queue to merge into main or master. Prefer an integration branch.",
     )
+    queue.add_argument(
+        "--archive-dir",
+        type=Path,
+        help="Move passing task files here. Default: tasks/archive in this repo.",
+    )
+    queue.add_argument(
+        "--tasks-root",
+        type=Path,
+        help="Folder archive paths are relative to. Default: the tasks directory that contains the queue.",
+    )
+    queue.add_argument(
+        "--no-archive",
+        action="store_true",
+        help="Do not archive. Passing files move to done/ and failing files to failed/.",
+    )
+    queue.add_argument(
+        "--stop-file",
+        type=Path,
+        help="Checked between tasks. Default: runtime/STOP_QUEUE.",
+    )
     queue.set_defaults(func=_queue)
+
+    archive = sub.add_parser("archive", help="Move one task file into the archive.")
+    archive.add_argument("task_file", type=Path)
+    archive.add_argument(
+        "--archive-dir",
+        type=Path,
+        help="Archive root. Default: tasks/archive in this repo.",
+    )
+    archive.add_argument(
+        "--tasks-root",
+        type=Path,
+        help="Folder the archive path is relative to.",
+    )
+    archive.set_defaults(func=_archive)
+
+    stop = sub.add_parser("stop", help="Ask a running queue to stop after the current task.")
+    stop.add_argument(
+        "--cancel",
+        action="store_true",
+        help="Withdraw a stop request so the queue keeps going.",
+    )
+    stop.add_argument(
+        "--stop-file",
+        type=Path,
+        help="Stop-request file. Default: runtime/STOP_QUEUE.",
+    )
+    stop.set_defaults(func=_stop)
 
     validate = sub.add_parser("validate", help="Check a task file or a task folder against the template.")
     validate.add_argument("target", type=Path)
@@ -173,7 +237,17 @@ def _health(args: argparse.Namespace) -> int:
     return 0 if healthy else 1
 
 
+def _reject_archive_flags(args: argparse.Namespace) -> str | None:
+    if getattr(args, "no_archive", False) and getattr(args, "archive_dir", None) is not None:
+        return "--no-archive and --archive-dir cannot be used together."
+    return None
+
+
 def _overnight(args: argparse.Namespace) -> int:
+    conflict = _reject_archive_flags(args)
+    if conflict:
+        print(f"error: {conflict}", file=sys.stderr)
+        return 2
     profile = get_profile(args.profile)
     task = load_task(args.task)
     log_dir = args.log_dir or (runtime_dir() / "logs" / "overnight")
@@ -191,6 +265,7 @@ def _overnight(args: argparse.Namespace) -> int:
         strict=not args.no_strict,
         context_char_limit=args.context_char_limit,
     )
+    archived = _archive_overnight_task(args, result.status == "passed")
     print(
         json.dumps(
             {
@@ -201,13 +276,39 @@ def _overnight(args: argparse.Namespace) -> int:
                 "iterations": result.iterations,
                 "report": str(result.report_path) if result.report_path else None,
                 "log_dir": str(result.log_dir),
+                "archived": str(archived) if archived else None,
             }
         )
     )
     return 0 if result.tests_passed else 1
 
 
+def _archive_overnight_task(args: argparse.Namespace, succeeded: bool) -> Path | None:
+    """Move a passing single-task file. A failure leaves it in place."""
+
+    if args.no_archive or not succeeded:
+        return None
+    try:
+        destination = maybe_archive_task(
+            args.task,
+            enabled=True,
+            succeeded=True,
+            archive_dir=args.archive_dir,
+            tasks_root=args.tasks_root,
+        )
+    except (OSError, ValueError) as exc:
+        print(f"warning: the run passed but the task file was not archived: {exc}", file=sys.stderr)
+        return None
+    if destination is not None:
+        print(f"Archived {args.task} -> {destination}", file=sys.stderr)
+    return destination
+
+
 def _queue(args: argparse.Namespace) -> int:
+    conflict = _reject_archive_flags(args)
+    if conflict:
+        print(f"error: {conflict}", file=sys.stderr)
+        return 2
     profile = get_profile(args.profile)
     log_dir = args.log_dir or (runtime_dir() / "logs" / "queue")
     result = run_queue(
@@ -222,7 +323,13 @@ def _queue(args: argparse.Namespace) -> int:
         continue_on_failure=args.continue_on_failure,
         strict=not args.no_strict,
         allow_main=args.allow_main,
+        archive=not args.no_archive,
+        archive_dir=args.archive_dir,
+        tasks_root=args.tasks_root,
+        stop_file=args.stop_file,
     )
+    if result.message:
+        print(result.message, file=sys.stderr)
     print(
         json.dumps(
             {
@@ -234,10 +341,43 @@ def _queue(args: argparse.Namespace) -> int:
                 "stopped_on": result.stopped_on,
                 "summary": str(result.summary_path),
                 "state": str(result.state_path),
+                "pending": result.pending,
+                "archived": result.archived,
+                "stayed": result.stayed,
+                "message": result.message,
             }
         )
     )
-    return 0 if result.status == "passed" else 1
+    # A requested stop is a clean exit even when later tasks never ran.
+    if result.status in {"passed", "stopped_on_request"}:
+        return 0
+    return 1
+
+
+def _archive(args: argparse.Namespace) -> int:
+    destination = archive_task(
+        args.task_file,
+        archive_dir=args.archive_dir,
+        tasks_root=args.tasks_root,
+    )
+    print(destination)
+    return 0
+
+
+def _stop(args: argparse.Namespace) -> int:
+    if args.cancel:
+        removed = cancel_stop(args.stop_file)
+        if removed:
+            print("Stop request withdrawn. The queue will keep going.")
+        else:
+            print("No stop request was waiting.")
+        return 0
+    path = request_stop(args.stop_file)
+    print(
+        "Stop requested. The queue will finish the task that is already running, "
+        f"then exit. File: {path}"
+    )
+    return 0
 
 
 def _validate(args: argparse.Namespace) -> int:

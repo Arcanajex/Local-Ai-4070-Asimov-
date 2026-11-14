@@ -6,15 +6,30 @@ the queue started, and the next file starts from that merge. A failure stops
 the queue so a later step cannot build on work that never landed. Pass
 continue_on_failure to keep going from the last successful merge anyway.
 
+A passing file is moved into the archive (``tasks/archive`` in this repo by
+default), keeping its path relative to the tasks root. A failing file stays
+where it is so it can be fixed and run again. ``--no-archive`` keeps the older
+layout: passed files move to ``done/`` and failed files to ``failed/``.
+
+Markdown inside the queued folder is included, except ``README.md``,
+``queue-summary.md``, and anything under ``done/``, ``failed/``, ``archive/``,
+or the configured archive directory. That exclusion still applies when the
+archive sits inside the queued folder.
+
 Progress is stored in queue-state.json in the task folder. Re-running the
-same command skips any task already recorded as passed. Passed files are
-moved to done/, failed files to failed/. Move a file from failed/ back to
-the task folder to retry it.
+same command skips any task already recorded as passed.
+
+Between tasks the queue looks for a stop file (``runtime/STOP_QUEUE``). When
+the file is present it starts nothing else, writes a summary, deletes the
+file, and returns. A stop file that already exists at startup is stale: the
+queue warns, deletes it, and runs. The file is never checked while a task is
+running.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import time
@@ -22,7 +37,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from local_agent import archive as task_archive
 from local_agent.config import Profile
+from local_agent.control import clear_stop_file, default_stop_file, stop_is_requested
 from local_agent.overnight import (
     OvernightResult,
     _commit_with_identity,
@@ -35,6 +52,7 @@ from local_agent.overnight import (
 STATE_NAME = "queue-state.json"
 SUMMARY_NAME = "queue-summary.md"
 SKIP_NAMES = {SUMMARY_NAME.lower(), "readme.md"}
+EXCLUDED_DIR_NAMES = {"done", "failed", "archive"}
 RunTask = Callable[..., OvernightResult]
 
 
@@ -49,32 +67,67 @@ class QueueResult:
     summary_path: Path
     state_path: Path
     tasks: list[dict[str, Any]] = field(default_factory=list)
+    pending: list[str] = field(default_factory=list)
+    archived: list[str] = field(default_factory=list)
+    stayed: list[str] = field(default_factory=list)
+    message: str = ""
 
 
-def natural_key(name: str) -> list[int | str]:
-    """Sort 2-a.md before 10-b.md. Digit runs compare as integers."""
+def natural_key(name: str) -> list[tuple[int, int | str]]:
+    """Sort 2-a.md before 10-b.md. Digit runs compare as integers.
+
+    Each piece is tagged so a number and a letter can be ordered in one list
+    (``1-c.md`` before ``ui/step.md``) without mixing int and str compares.
+    """
 
     parts = re.split(r"(\d+)", name)
-    key: list[int | str] = []
+    key: list[tuple[int, int | str]] = []
     for part in parts:
         if not part:
             continue
-        key.append(int(part) if part.isdigit() else part.lower())
+        if part.isdigit():
+            key.append((0, int(part)))
+        else:
+            key.append((1, part.lower()))
     return key
 
 
-def list_task_files(task_dir: Path) -> list[Path]:
-    """Top-level task markdown, in natural filename order.
+def task_key(path: Path, task_dir: Path) -> str:
+    """Stable id for queue state. Top-level files stay ``name.md``."""
 
-    done/, failed/, the summary, and a README in the folder are not tasks.
+    return path.resolve().relative_to(Path(task_dir).resolve()).as_posix()
+
+
+def list_task_files(task_dir: Path, *, archive_dir: Path | None = None) -> list[Path]:
+    """Task markdown under ``task_dir``, in natural path order.
+
+    ``done/``, ``failed/``, ``archive/``, hidden directories, and ``archive_dir``
+    are not tasks. A queue pointed at the archive itself returns nothing.
+    ``README.md`` and ``queue-summary.md`` are not tasks at any depth.
     """
 
-    files = [
-        path
-        for path in task_dir.glob("*.md")
-        if path.is_file() and path.name.lower() not in SKIP_NAMES
-    ]
-    return sorted(files, key=lambda path: natural_key(path.name))
+    root = Path(task_dir).resolve()
+    if not root.is_dir():
+        return []
+    archive_resolved = Path(archive_dir).resolve() if archive_dir is not None else None
+    if _scan_excluded(root, archive_resolved):
+        return []
+    found: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        current = Path(dirpath)
+        dirnames[:] = [
+            name
+            for name in dirnames
+            if not _scan_excluded(current / name, archive_resolved)
+        ]
+        for name in filenames:
+            if not name.lower().endswith(".md") or name.lower() in SKIP_NAMES:
+                continue
+            path = current / name
+            if archive_resolved is not None and _is_under(path.resolve(), archive_resolved):
+                continue
+            found.append(path)
+    return sorted(found, key=lambda path: natural_key(path.relative_to(root).as_posix()))
 
 
 def load_state(path: Path) -> dict[str, Any]:
@@ -95,11 +148,16 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
-def pending_tasks(task_dir: Path, state: dict[str, Any]) -> tuple[list[Path], list[str]]:
+def pending_tasks(
+    task_dir: Path,
+    state: dict[str, Any],
+    *,
+    archive_dir: Path | None = None,
+) -> tuple[list[Path], list[str]]:
     """Return (to_run, skipped_names).
 
     A task recorded as passed is skipped even if its file is still in the
-    folder, which covers a crash between the commit and the move into done/.
+    folder, which covers a crash between the commit and the move.
     """
 
     passed = {
@@ -108,7 +166,11 @@ def pending_tasks(task_dir: Path, state: dict[str, Any]) -> tuple[list[Path], li
         if isinstance(record, dict) and record.get("status") == "passed"
     }
     skipped = [name for name in passed]
-    pending = [path for path in list_task_files(task_dir) if path.name not in passed]
+    pending = [
+        path
+        for path in list_task_files(task_dir, archive_dir=archive_dir)
+        if task_key(path, task_dir) not in passed
+    ]
     return pending, skipped
 
 
@@ -163,6 +225,9 @@ def render_summary(
     profile_name: str,
     tasks: list[dict[str, Any]],
     stopped_on: str | None,
+    pending: list[str] | None = None,
+    stop_request: bool = False,
+    late_stop_note: str = "",
 ) -> str:
     lines = [
         "# Queue summary",
@@ -174,6 +239,21 @@ def render_summary(
     ]
     if stopped_on:
         lines.append(f"- Stopped on: {stopped_on}")
+    if stop_request:
+        lines.append(
+            "- Stopped on request: the current task was allowed to finish. "
+            "No new task was started."
+        )
+        names = ", ".join(pending or []) or "(none)"
+        lines.append(f"- Still pending: {names}")
+    if late_stop_note:
+        lines.append(f"- {late_stop_note}")
+    archived_lines, stayed_lines = _disposition_lines(tasks)
+    if archived_lines or stayed_lines or stop_request:
+        lines.extend(["", "## Archived", ""])
+        lines.extend(archived_lines or ["- (none)"])
+        lines.extend(["", "## Stayed", ""])
+        lines.extend(stayed_lines or ["- (none)"])
     lines.extend(
         [
             "",
@@ -197,6 +277,20 @@ def render_summary(
         )
     lines.append("")
     return "\n".join(lines)
+
+
+def _disposition_lines(tasks: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
+    archived: list[str] = []
+    stayed: list[str] = []
+    ordered = sorted(tasks, key=lambda record: natural_key(str(record.get("name", ""))))
+    for record in ordered:
+        name = str(record.get("name", ""))
+        disposition = record.get("disposition")
+        if disposition == "archived":
+            archived.append(f"- {name} -> {record.get('stored_at', '')}")
+        elif disposition == "stayed":
+            stayed.append(f"- {name} ({record.get('status', '')}) left in place")
+    return archived, stayed
 
 
 def _format_duration(seconds: Any) -> str:
@@ -225,6 +319,10 @@ def run_queue(
     continue_on_failure: bool = False,
     strict: bool = True,
     allow_main: bool = False,
+    archive: bool = True,
+    archive_dir: Path | None = None,
+    tasks_root: Path | None = None,
+    stop_file: Path | None = None,
     run_task: RunTask | None = None,
 ) -> QueueResult:
     task_dir = Path(task_dir).resolve()
@@ -233,6 +331,13 @@ def run_queue(
     if not task_dir.is_dir():
         raise FileNotFoundError(f"task folder does not exist: {task_dir}")
     ensure_repository(project, init_repo=init_repo)
+
+    tasks_root_resolved = task_archive.resolve_tasks_root(task_dir, tasks_root)
+    archive_root = Path(archive_dir).resolve() if archive_dir is not None else task_archive.default_archive_dir()
+    # Exclusion uses the archive root even when moves are turned off, so a
+    # folder of finished tasks is not picked up again under --no-archive.
+    scan_archive = archive_root
+    stop_path = Path(stop_file).resolve() if stop_file is not None else default_stop_file()
 
     state_path = task_dir / STATE_NAME
     summary_path = task_dir / SUMMARY_NAME
@@ -251,30 +356,35 @@ def run_queue(
     state["project"] = str(project)
     state["profile"] = profile.name
 
-    pending, skipped_names = pending_tasks(task_dir, state)
+    discovered = list_task_files(task_dir, archive_dir=scan_archive)
     if strict:
         from local_agent.taskcheck import format_problems, validate_task_files
 
-        problems = validate_task_files(list_task_files(task_dir), project)
+        problems = validate_task_files(discovered, project)
         if problems:
             raise RuntimeError(format_problems(problems))
+    pending, skipped_names = pending_tasks(task_dir, state, archive_dir=scan_archive)
     if not pending and not state["tasks"]:
         raise RuntimeError(
             f"No task markdown files in {task_dir}. "
-            "Add files such as 01-runner.md. README.md and queue-summary.md are ignored."
+            "Add files such as 01-runner.md. README.md, queue-summary.md, "
+            "and files under archive/, done/, or failed/ are ignored."
         )
 
     runner = run_task or _default_run_task
     stopped_on: str | None = None
     stopped_early = False
+    stopped_on_request = False
+    request_pending: list[str] = []
+    late_stop_note = ""
     log_dir.mkdir(parents=True, exist_ok=True)
 
     def persist(*, in_progress: bool = False) -> None:
         save_state(state_path, state)
-        if in_progress and not stopped_early:
+        if in_progress and not stopped_early and not stopped_on_request:
             status = "running"
         else:
-            status = _overall_status(state, stopped_early)
+            status = _overall_status(state, stopped_early, stopped_on_request)
         summary = render_summary(
             status=status,
             project=project,
@@ -282,13 +392,36 @@ def run_queue(
             profile_name=profile.name,
             tasks=list(state["tasks"].values()),
             stopped_on=stopped_on,
+            pending=request_pending,
+            stop_request=stopped_on_request,
+            late_stop_note=late_stop_note,
         )
         summary_path.write_text(summary, encoding="utf-8", newline="\n")
 
-    for path in pending:
+    # A stop file left behind by an earlier run must not cancel this one.
+    # The request is created after the queue has started, from another window.
+    if stop_is_requested(stop_path):
+        print(
+            f"warning: removing stale stop request at {stop_path}. "
+            "A stop file left from an earlier run does not stop a new queue. "
+            "Ask again after this queue has started "
+            "(scripts/stop-queue.ps1, or python -m local_agent stop).",
+            file=sys.stderr,
+        )
+        clear_stop_file(stop_path)
+
+    for index, path in enumerate(pending):
+        # Checked only here, before a task starts. The runner is not
+        # interrupted when the file appears mid-task.
+        if stop_is_requested(stop_path):
+            stopped_on_request = True
+            request_pending = [task_key(item, task_dir) for item in pending[index:]]
+            clear_stop_file(stop_path)
+            break
+        key = task_key(path, task_dir)
         _git(project, "checkout", base_branch)
         task = load_task(path)
-        task_log = log_dir / path.stem
+        task_log = log_dir / key.replace("/", "-")
         started = time.perf_counter()
         try:
             result = runner(
@@ -304,10 +437,10 @@ def run_queue(
             )
         except Exception as exc:
             duration = time.perf_counter() - started
-            moved = _move_task(path, task_dir / "failed")
+            stored, disposition = _store_failure(path, task_dir, archive=archive)
             _record(
                 state,
-                path.name,
+                key,
                 status="error",
                 branch="",
                 commit=None,
@@ -315,10 +448,11 @@ def run_queue(
                 iterations=0,
                 duration=duration,
                 detail=str(exc),
-                stored_at=str(moved),
+                stored_at=stored,
+                disposition=disposition,
             )
             if not continue_on_failure:
-                stopped_on = path.name
+                stopped_on = key
                 stopped_early = True
             persist(in_progress=True)
             _return_to_base(project, base_branch)
@@ -331,10 +465,10 @@ def run_queue(
             try:
                 merge_commit = merge_no_ff(project, base_branch, result.branch) if result.branch else ""
             except Exception as exc:
-                moved = _move_task(path, task_dir / "failed")
+                stored, disposition = _store_failure(path, task_dir, archive=archive)
                 _record(
                     state,
-                    path.name,
+                    key,
                     status="merge_failed",
                     branch=result.branch,
                     commit=result.commit,
@@ -342,33 +476,41 @@ def run_queue(
                     iterations=result.iterations,
                     duration=duration,
                     detail=str(exc),
-                    stored_at=str(moved),
+                    stored_at=stored,
+                    disposition=disposition,
                 )
-                stopped_on = path.name
+                stopped_on = key
                 stopped_early = True
                 persist(in_progress=True)
                 _return_to_base(project, base_branch)
                 break
-            moved = _move_task(path, task_dir / "done")
+            stored, disposition, detail = _store_success(
+                path,
+                task_dir,
+                archive=archive,
+                archive_root=archive_root,
+                tasks_root=tasks_root_resolved,
+            )
             _record(
                 state,
-                path.name,
+                key,
                 status="passed",
                 branch=result.branch,
                 commit=result.commit,
                 merge_commit=merge_commit,
                 iterations=result.iterations,
                 duration=duration,
-                detail="",
-                stored_at=str(moved),
+                detail=detail,
+                stored_at=stored,
+                disposition=disposition,
             )
             persist(in_progress=True)
             continue
 
-        moved = _move_task(path, task_dir / "failed")
+        stored, disposition = _store_failure(path, task_dir, archive=archive)
         _record(
             state,
-            path.name,
+            key,
             status=result.status or "failed",
             branch=result.branch,
             commit=result.commit,
@@ -376,10 +518,11 @@ def run_queue(
             iterations=result.iterations,
             duration=duration,
             detail="tests did not pass" if not result.tests_passed else "review rejected the change",
-            stored_at=str(moved),
+            stored_at=stored,
+            disposition=disposition,
         )
         if not continue_on_failure:
-            stopped_on = path.name
+            stopped_on = key
             stopped_early = True
         persist(in_progress=True)
         _return_to_base(project, base_branch)
@@ -390,16 +533,52 @@ def run_queue(
     for name in skipped_names:
         source = task_dir / name
         record = state["tasks"].get(name) or {}
-        if source.is_file() and not str(record.get("stored_at", "")).startswith(str(task_dir / "done")):
+        if not source.is_file():
+            continue
+        if archive:
+            if str(record.get("stored_at", "")).startswith(str(archive_root)):
+                continue
+            stored, disposition, detail = _store_success(
+                source,
+                task_dir,
+                archive=True,
+                archive_root=archive_root,
+                tasks_root=tasks_root_resolved,
+            )
+            record["stored_at"] = stored
+            record["disposition"] = disposition
+            if detail:
+                record["detail"] = detail
+            state["tasks"][name] = record
+            continue
+        if not str(record.get("stored_at", "")).startswith(str(task_dir / "done")):
             moved = _move_task(source, task_dir / "done")
             record["stored_at"] = str(moved)
+            record["disposition"] = "done"
             state["tasks"][name] = record
 
-    status = _overall_status(state, stopped_early)
+    if stop_is_requested(stop_path) and not stopped_on_request:
+        clear_stop_file(stop_path)
+        late_stop_note = (
+            "A stop request arrived after the last queued task had already started. "
+            "Nothing was left pending."
+        )
+
+    status = _overall_status(state, stopped_early, stopped_on_request)
+    if stopped_on_request:
+        pending_text = ", ".join(request_pending) if request_pending else "(none)"
+        message = (
+            "Stopped on request. The current task was allowed to finish. "
+            f"No new task was started. Still pending: {pending_text}."
+        )
+    else:
+        message = ""
     persist()
     records = list(state["tasks"].values())
     failed = sum(1 for record in records if record.get("status") != "passed")
     passed = sum(1 for record in records if record.get("status") == "passed")
+    archived = [str(record.get("stored_at", "")) for record in records if record.get("disposition") == "archived"]
+    stayed = [str(record.get("name", "")) for record in records if record.get("disposition") == "stayed"]
     return QueueResult(
         status=status,
         base_branch=base_branch,
@@ -410,6 +589,10 @@ def run_queue(
         summary_path=summary_path,
         state_path=state_path,
         tasks=sorted(records, key=lambda record: natural_key(str(record.get("name", "")))),
+        pending=request_pending,
+        archived=archived,
+        stayed=stayed,
+        message=message,
     )
 
 
@@ -417,8 +600,10 @@ def _default_run_task(**kwargs: Any) -> OvernightResult:
     return run_overnight(**kwargs)
 
 
-def _overall_status(state: dict[str, Any], stopped_early: bool) -> str:
+def _overall_status(state: dict[str, Any], stopped_early: bool, stopped_on_request: bool) -> str:
     records = list((state.get("tasks") or {}).values())
+    if stopped_on_request:
+        return "stopped_on_request"
     if stopped_early:
         return "stopped"
     if any(record.get("status") != "passed" for record in records):
@@ -438,6 +623,7 @@ def _record(
     duration: float,
     detail: str,
     stored_at: str,
+    disposition: str,
 ) -> None:
     state["tasks"][name] = {
         "name": name,
@@ -449,7 +635,41 @@ def _record(
         "duration_seconds": round(duration, 3),
         "detail": detail,
         "stored_at": stored_at,
+        "disposition": disposition,
     }
+
+
+def _store_success(
+    source: Path,
+    task_dir: Path,
+    *,
+    archive: bool,
+    archive_root: Path,
+    tasks_root: Path,
+) -> tuple[str, str, str]:
+    """Move a passing task. Returns (stored_at, disposition, detail)."""
+
+    if not archive:
+        return str(_move_task(source, task_dir / "done")), "done", ""
+    try:
+        moved = task_archive.archive_task(
+            source,
+            archive_dir=archive_root,
+            tasks_root=tasks_root,
+        )
+    except (OSError, ValueError) as exc:
+        return str(source), "stayed", f"passed but archive failed: {exc}"
+    return str(moved), "archived", ""
+
+
+def _store_failure(source: Path, task_dir: Path, *, archive: bool) -> tuple[str, str]:
+    """Keep a failing task in place, or move it to failed/ when archive is off."""
+
+    if archive:
+        return str(source), "stayed"
+    if not source.is_file():
+        return str(source), "failed"
+    return str(_move_task(source, task_dir / "failed")), "failed"
 
 
 def _move_task(source: Path, dest_dir: Path) -> Path:
@@ -473,3 +693,23 @@ def _return_to_base(project: Path, base_branch: str) -> None:
     if current == base_branch:
         return
     _git(project, "checkout", base_branch)
+
+
+def _scan_excluded(path: Path, archive_dir: Path | None) -> bool:
+    """True when this directory must not contribute task files."""
+
+    name = path.name.lower()
+    if name.startswith(".") or name in EXCLUDED_DIR_NAMES:
+        return True
+    if archive_dir is None:
+        return False
+    resolved = path.resolve()
+    return resolved == archive_dir or _is_under(resolved, archive_dir)
+
+
+def _is_under(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return path != parent

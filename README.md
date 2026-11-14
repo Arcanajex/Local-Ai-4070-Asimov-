@@ -288,7 +288,7 @@ Write tasks with [docs/TASK_TEMPLATE.md](docs/TASK_TEMPLATE.md). Required headin
 python -m local_agent validate C:\src\my-app\tasks --project C:\src\my-app
 ```
 
-The queue checks every task file before the first one starts and refuses with the full list of problems. `-NoStrict` (`--no-strict`) runs older files, including `tasks/ui/*`, that predate the template.
+The queue checks every task file before the first one starts, including markdown in task-list subfolders, and refuses with the full list of problems. `-NoStrict` (`--no-strict`) runs older files, including `tasks/ui/*`, that predate the template. Files under `tasks\archive` are not checked and are not run.
 
 The self-review must answer `Acceptance criteria` (each line `met` or `not met`), `Out-of-scope files touched`, and `Conflicts with AGENTS.md or decisions`. A `not met` line or a conflict runs one fix iteration and a second review. The diff in that prompt starts with the file list. If the patch does not fit, the prompt names the files that were left out.
 
@@ -321,14 +321,45 @@ python -m local_agent queue --task-dir C:\src\my-app\tasks --project C:\src\my-a
 What it does:
 
 1. Holds sleep off and switches to the High performance power scheme for the whole queue, then restores the previous scheme. `llama-server` is started once if it is not already healthy.
-2. Runs `*.md` in the task folder in natural filename order (`2` before `10`). `README.md`, `queue-summary.md`, and files already inside `done\` or `failed\` are not tasks.
+2. Runs task markdown in the folder and in task-list subfolders, in natural path order (`2` before `10`, then `ui\step-2.md`). `README.md`, `queue-summary.md`, and anything under `archive\`, `done\`, or `failed\` are not tasks. A custom `-ArchiveDir` is skipped too, including when that folder sits inside the queue.
 3. Each file is an overnight run. The branch checked out at the start is remembered in `queue-state.json`.
-4. When tests pass, that agent branch is merged with `--no-ff` back into the remembered branch. The next file starts from the merge.
-5. When tests fail, the queue stops. The failed branch is not merged, and the project is checked out on the base branch again so a later retry does not build on the failure. `-ContinueOnFailure` runs the remaining files from that last good merge anyway.
-6. A passing file is moved to `done\`. A failing file is moved to `failed\`. `queue-state.json` records status, branch, commit, iterations, and duration. Run the same command again to resume: passed tasks are skipped. To retry a failure, move its file from `failed\` back into the task folder.
-7. `queue-summary.md` in the task folder lists every task. When the queue ends, Windows shows a toast and plays a beep. If the toast cannot be shown, the script warns and still exits with the real result.
+4. When tests and the review pass, that agent branch is merged with `--no-ff` back into the remembered branch. The next file starts from the merge.
+5. When a task fails, the queue stops. The failed branch is not merged, and the project is checked out on the base branch again so a later retry does not build on the failure. The task file stays where it is, so you can edit it and run the same command again. `-ContinueOnFailure` runs the remaining files from that last good merge anyway.
+6. A passing file is moved into `tasks\archive` in this repo. The path relative to the tasks root is kept: `tasks\foo.md` becomes `tasks\archive\foo.md`, and `tasks\ui\step-2.md` becomes `tasks\archive\ui\step-2.md`. The mirror folder is created if it is missing. If that name is already in the archive, the new file gets a `-YYYYmmdd-HHMMSS` suffix and the old file is left alone. `-ArchiveDir D:\task-archive` changes the root. `-TasksRoot` changes the folder the relative path is measured from. `-NoArchive` keeps the older layout: passing files move to `done\` and failing files to `failed\`.
+7. `queue-summary.md` in the task folder lists every task, then which files were archived and which stayed. When the queue ends, Windows shows a toast and plays a beep. If the toast cannot be shown, the script warns and still exits with the real result.
 
 `-InitRepo` and `-MaxHoursPerTask` match the overnight switches. `-MaxHoursPerTask` is the budget for each file, not the whole queue.
+
+Stop the queue after the task that is running, so you can shut the server down without waiting for the rest of the folder. From another PowerShell window:
+
+```powershell
+.\scripts\stop-queue.ps1
+python -m local_agent stop
+```
+
+The running task finishes. Nothing after it starts. The summary says `Stopped on request` and lists the files still pending. The stop file is deleted and the process exits 0.
+
+Withdraw the request if the queue should keep going:
+
+```powershell
+.\scripts\stop-queue.ps1 -Cancel
+python -m local_agent stop --cancel
+```
+
+The request file is `runtime\STOP_QUEUE` (or `LOCAL_AGENT_RUNTIME\STOP_QUEUE`). A file that is already there when a queue starts is stale: the queue warns, deletes it, and runs. Create the request after the queue has started. Ctrl+C in the queue window is not this. Windows hands that interrupt to `python.exe`, which aborts the task in progress. That is not reliable as a two-stage stop on Windows PowerShell 5.1 and PowerShell 7, so the scripts do not treat a second Ctrl+C as special.
+
+A single overnight run archives the task file on success the same way. A failed run leaves the file in place.
+
+```powershell
+.\scripts\overnight.ps1 -Task .\tasks\ui\step-2.md -Project C:\src\my-app -Profile quality
+.\scripts\overnight.ps1 -Task .\tasks\ui\step-2.md -Project C:\src\my-app -NoArchive
+python -m local_agent archive .\tasks\ui\step-2.md
+python -m local_agent archive .\tasks\foo.md --archive-dir D:\task-archive --tasks-root .\tasks
+.\scripts\queue.ps1 -TaskDir .\tasks -Project C:\src\my-app -Profile quality -ArchiveDir D:\task-archive
+.\scripts\queue.ps1 -TaskDir .\tasks\ui -Project C:\src\my-app -Profile quality -NoArchive
+```
+
+Point `-TaskDir` at one list (`tasks\ui`) when you do not want every list under `tasks` to run in the same queue.
 
 If the time budget hits first, the branch and the report are still written. The script's exit code is 0 only when the test command passed.
 
@@ -453,6 +484,9 @@ python -m local_agent download --url <url> --dest <path> --expected-size <bytes>
 python -m local_agent health --profile quality
 python -m local_agent tune --profile quality
 python -m local_agent overnight --task tasks/smoke-task.md --project <git-repo> --profile quality
+python -m local_agent archive tasks/ui/step-2.md
+python -m local_agent stop
+python -m local_agent stop --cancel
 ```
 
 ## What was not run on an RTX 4070
