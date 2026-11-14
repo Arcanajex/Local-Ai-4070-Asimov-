@@ -18,6 +18,7 @@ SCRIPTS = [
     "tune-n-cpu-moe.ps1",
     "overnight.ps1",
     "queue.ps1",
+    "stop-queue.ps1",
     "smoke-test.ps1",
     "lib.ps1",
 ]

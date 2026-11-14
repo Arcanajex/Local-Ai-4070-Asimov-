@@ -67,3 +67,20 @@ template.
 
 `AGENTS.md` at the root of the target repo is always included when it exists.
 It is not named in `context`.
+
+## After the task passes
+
+A queue moves a passing file into `tasks\archive` in this repo and keeps the
+folders under the tasks root. `tasks\foo.md` becomes `tasks\archive\foo.md`.
+`tasks\ui\step-2.md` becomes `tasks\archive\ui\step-2.md`. A name that is
+already there gets a timestamp suffix; the older file is not overwritten.
+
+A failing file stays in the task folder so it can be edited and run again.
+`queue-summary.md` lists the files that were archived and the files that
+stayed. `-NoArchive` (`--no-archive`) leaves the older `done\` and `failed\`
+layout in place. `python -m local_agent archive path\to\task.md` moves one
+file the same way, and a passing `overnight` run does too unless `-NoArchive`
+is set.
+
+The queue does not read `tasks\archive`, including when that folder is inside
+the directory you passed as `-TaskDir`.

@@ -31,6 +31,16 @@
 .PARAMETER MaxIterations
   How many times the runner may execute the test command and hand a failure
   back to the model. Default 6.
+
+.PARAMETER ArchiveDir
+  When the run passes, move the task file here. Default is tasks\archive
+  in this repo. The path under the tasks root is kept.
+
+.PARAMETER TasksRoot
+  Folder the archive path is relative to.
+
+.PARAMETER NoArchive
+  Leave the task file where it is, including when the run passes.
 #>
 [CmdletBinding()]
 param(
@@ -38,6 +48,8 @@ param(
     [Parameter(Mandatory = $true)][string]$Project,
     [string]$Profile = 'quality',
     [string]$InstallDir = '',
+    [string]$ArchiveDir = '',
+    [string]$TasksRoot = '',
     [double]$MaxHours = 8,
     [int]$MaxIterations = 6,
     [int]$Port = 8080,
@@ -45,7 +57,8 @@ param(
     [switch]$SkipPerformancePlan,
     [switch]$NoStartServer,
     [switch]$InitRepo,
-    [switch]$NoStrict
+    [switch]$NoStrict,
+    [switch]$NoArchive
 )
 
 $ErrorActionPreference = 'Stop'
@@ -53,6 +66,9 @@ Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'lib.ps1')
 
 Assert-NativeWindows
+if ($NoArchive -and $ArchiveDir) {
+    throw '-NoArchive and -ArchiveDir cannot be used together.'
+}
 $InstallDir = Get-InstallDir $InstallDir
 $python = Get-VenvPython $InstallDir
 
@@ -146,6 +162,15 @@ try {
     if ($NoStrict) {
         $agentArgs += '--no-strict'
     }
+    if ($NoArchive) {
+        $agentArgs += '--no-archive'
+    }
+    if ($ArchiveDir) {
+        $agentArgs += @('--archive-dir', $ArchiveDir)
+    }
+    if ($TasksRoot) {
+        $agentArgs += @('--tasks-root', $TasksRoot)
+    }
     & $python @agentArgs
     $code = $LASTEXITCODE
 } finally {
@@ -163,5 +188,9 @@ if ($code -ne 0) {
     Write-Host "Overnight run finished without passing tests (exit $code). The branch, AGENT_REPORT.md, and $log still have the work."
     exit $code
 }
-Write-Host 'Overnight run passed. See AGENT_REPORT.md in the target project.'
+if ($NoArchive) {
+    Write-Host 'Overnight run passed. See .agent\AGENT_REPORT.md in the target project. The task file was left in place.'
+} else {
+    Write-Host 'Overnight run passed. See .agent\AGENT_REPORT.md in the target project. When the review accepts the change, the task file is moved under tasks\archive.'
+}
 exit 0

@@ -138,6 +138,7 @@ def test_validate_command_and_queue_refuses_before_the_first_task(tmp_path, caps
             profile=get_profile("day"),
             client=None,
             log_dir=tmp_path / "logs",
+            archive=False,
             run_task=_noop(calls),
         )
     except RuntimeError as exc:
@@ -152,6 +153,7 @@ def test_validate_command_and_queue_refuses_before_the_first_task(tmp_path, caps
         profile=get_profile("day"),
         client=None,
         log_dir=tmp_path / "logs",
+        archive=False,
         strict=False,
         continue_on_failure=True,
         run_task=_noop(calls),
@@ -171,6 +173,7 @@ def test_queue_requires_allow_main_on_the_default_branch(tmp_path):
             profile=get_profile("day"),
             client=None,
             log_dir=tmp_path / "logs",
+            archive=False,
             run_task=_noop([]),
         )
     except RuntimeError as exc:
@@ -186,6 +189,7 @@ def test_queue_requires_allow_main_on_the_default_branch(tmp_path):
         client=None,
         log_dir=tmp_path / "logs",
         allow_main=True,
+        archive=False,
         run_task=_passing(),
     )
     assert result.status == "passed"
