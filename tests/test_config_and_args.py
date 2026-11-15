@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
 from local_agent.config import get_profile, write_override
-from local_agent.server_args import build_server_args
+from local_agent.server_args import build_server_args, format_args, split_json_args
 
 
 def _flag(args: list[str], name: str) -> str:
@@ -93,6 +94,60 @@ def test_server_args_pin_the_laptop_safe_flags():
     assert "--n-cpu-moe" not in dense
     assert _flag(dense, "--reasoning-effort") == "high"
     assert _flag(dense, "--chat-template-kwargs") == '{"preserve_thinking":true}'
+
+
+def test_split_json_args_moves_objects_into_llama_env_vars():
+    """PowerShell 5.1 strips quotes inside a native argument. The env value keeps them."""
+
+    original = [
+        "--model",
+        "Qwen.gguf",
+        "--chat-template-kwargs",
+        '{"preserve_thinking":true}',
+        "--jinja",
+        "--mcp-servers-json",
+        '{"servers":[]}',
+    ]
+    argv, env = split_json_args(original)
+    assert original[2] == "--chat-template-kwargs"
+    assert argv == ["--model", "Qwen.gguf", "--jinja"]
+    assert env == {
+        "LLAMA_ARG_CHAT_TEMPLATE_KWARGS": '{"preserve_thinking":true}',
+        "LLAMA_ARG_MCP_SERVERS_JSON": '{"servers":[]}',
+    }
+    assert '"' in env["LLAMA_ARG_CHAT_TEMPLATE_KWARGS"]
+
+
+def test_quality_and_max_launch_with_preserve_thinking_in_the_environment():
+    for name in ("quality", "max"):
+        args = build_server_args(get_profile(name), model_file=Path(f"{name}.gguf"))
+        argv, env = split_json_args(args)
+        assert "--chat-template-kwargs" not in argv
+        assert env == {"LLAMA_ARG_CHAT_TEMPLATE_KWARGS": '{"preserve_thinking":true}'}
+        payload = json.loads(format_args(args, "launch"))
+        assert payload["args"] == argv
+        assert payload["env"] == env
+        # The logical argv still shows the flag. Launch is the process hand-off.
+        assert "--chat-template-kwargs" in json.loads(format_args(args, "json"))
+
+
+def test_day_profile_launch_has_no_json_env():
+    day = build_server_args(get_profile("day"), model_file=Path("gpt.gguf"))
+    argv, env = split_json_args(day)
+    assert argv == day
+    assert env == {}
+    payload = json.loads(format_args(day, "launch"))
+    assert payload == {"args": day, "env": {}}
+
+
+def test_split_json_args_leaves_plain_tokens_and_rejects_a_bare_flag():
+    argv, env = split_json_args(["--alias", "{not-json", "--n-predict", "-1"])
+    assert argv == ["--alias", "{not-json", "--n-predict", "-1"]
+    assert env == {}
+    with pytest.raises(ValueError, match="chat-template-kwargs"):
+        split_json_args(["--jinja", "--chat-template-kwargs"])
+    with pytest.raises(ValueError, match="JSON"):
+        split_json_args(["--chat-template-kwargs", "--jinja"])
 
 
 def test_overrides_replace_offload_and_reject_typos(tmp_path):

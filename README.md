@@ -143,7 +143,7 @@ Do not point the harness at a 7B-9B "coder" model. In that bench they finished a
 
 ### Flags every profile shares
 
-These are built by `python -m local_agent server-args` and passed through by `start-server.ps1`.
+These are built by `python -m local_agent server-args` and passed through by `start-server.ps1`. A value that is a JSON object is handed over as a `LLAMA_ARG_*` environment variable (`server-args --format launch`). Windows PowerShell 5.1 strips the double quotes inside a native argument, and llama-server then cannot parse the JSON.
 
 - `--host 127.0.0.1` so the API is not on the network. There is no API key because nothing outside the machine should be able to reach it.
 - `--n-gpu-layers all` so attention (and, for MoE, the non-expert weights) can sit on the GPU. Expert or FFN placement is the other flag.
@@ -152,7 +152,7 @@ These are built by `python -m local_agent server-args` and passed through by `st
 - `--jinja`. Tool calling uses the chat template stored in the GGUF. Current llama-server builds default this on; the flag is still passed.
 - `--flash-attn on` and `--cache-type-k q8_0 --cache-type-v q8_0`. Quantized KV needs flash attention on CUDA.
 - `--batch-size 512 --ubatch-size 512`. A 2048 ubatch is faster and is what the gpt-oss guide uses on larger cards. It also grows the CUDA compute buffer, which is a common OOM on 8 GB.
-- `--reasoning on`. `quality` passes `--reasoning-budget 10240` (llama.cpp b12110: `-1` unrestricted, `0` ends thinking immediately, `N>0` is a token cap) so the trace cannot eat the whole completion. `max` still passes `--reasoning-budget -1`. `day` passes `--reasoning-effort medium`. `max` passes `--reasoning-effort high` rather than the template's `xhigh` default, so a turn can finish inside the token budget. `quality` and `max` also pass `--chat-template-kwargs {"preserve_thinking":true}`. That key is the Qwen template's switch for keeping prior thinking; gpt-oss does not get it. If a future llama.cpp build rejects the key, set `"preserve_thinking": false` in `runtime\overrides.json`.
+- `--reasoning on`. `quality` passes `--reasoning-budget 10240` (llama.cpp b12110: `-1` unrestricted, `0` ends thinking immediately, `N>0` is a token cap) so the trace cannot eat the whole completion. `max` still passes `--reasoning-budget -1`. `day` passes `--reasoning-effort medium`. `max` passes `--reasoning-effort high` rather than the template's `xhigh` default, so a turn can finish inside the token budget. `quality` and `max` set chat-template kwargs to `{"preserve_thinking":true}`. That key is the Qwen template's switch for keeping prior thinking; gpt-oss does not get it. The launcher and the tuner put the JSON in `LLAMA_ARG_CHAT_TEMPLATE_KWARGS` (the name llama.cpp b12110 prints in `--help`) and leave `--chat-template-kwargs` off the command line. If a future llama.cpp build rejects the key, set `"preserve_thinking": false` in `runtime\overrides.json`.
 - Sampling: Qwen profiles use temperature 0.6, top-p 0.95, top-k 20, repeat penalty 1.0. gpt-oss uses temperature 1.0 and top-p 1.0, which is the sampling the model was released with. Repeat penalty above 1.0 tends to damage thinking traces, so it stays at 1.0.
 
 ## Install from scratch on Windows 11
@@ -267,7 +267,7 @@ Health check, from another window:
 Invoke-RestMethod http://127.0.0.1:8080/health
 ```
 
-The exact argument vector is saved under `runtime\logs\server-<profile>-<time>.argv.txt`.
+The exact argument vector is saved under `runtime\logs\server-<profile>-<time>.argv.txt`. JSON settings are a `# env LLAMA_ARG_...=` line in that file, which is the value the process inherited.
 
 `-Background` opens a new PowerShell window and returns. `overnight.ps1` does that when port 8080 is down.
 
@@ -460,6 +460,8 @@ Prefill on a long agent prompt is slower than the decode number. The generation 
 - For a faster daytime loop where you do not need the trace, set `"reasoning": "off"` on `quality`. The bench found thinking off about 2.7x faster on the easy task, and the tool calls still worked. Overnight quality runs should leave reasoning on.
 
 **`context size` / `n_ctx` errors in the server window.** The prompt did not fit. The harness compacts and retries once. If it keeps happening, the task's test output is huge: the runner already truncates what it pastes back, but a profile `context` of 16384 (`max`) will feel cramped. Raise `context` only if `nvidia-smi` shows the headroom, then retune.
+
+**`error while handling argument "--chat-template-kwargs"`, `json.exception.parse_error.101`, last read `'{p'`.** PowerShell 5.1 dropped the double quotes inside the JSON, so llama-server read `{preserve_thinking:true}`. Start with `.\scripts\start-server.ps1`. That script and `tune-n-cpu-moe.ps1` (including `-Check`) put `{"preserve_thinking":true}` in `LLAMA_ARG_CHAT_TEMPLATE_KWARGS` and leave the flag off the command line. Live smoke and live eval talk to a server already started that way. A window where you start `llama-server.exe` yourself needs the same variable set before the process starts. `runtime\logs\server-<profile>-<time>.argv.txt` lists the real arguments and a `# env` line for the JSON. The tuner writes the same `# env` line at the top of `runtime\logs\tune\<profile>\*.log`.
 
 **Port 8080 is already in use.** Another `llama-server` is running. Close that window, or start with `-Port 8081` and pass the same port to `overnight.ps1`.
 

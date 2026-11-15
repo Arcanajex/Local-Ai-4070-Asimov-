@@ -17,6 +17,7 @@ loads is not a success unless `nvidia-smi` memory.used stays at least
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import time
 import urllib.request
@@ -27,7 +28,7 @@ from typing import Any
 from local_agent.client import server_is_healthy
 from local_agent.config import Profile, get_profile, write_override
 from local_agent.paths import llama_server_path
-from local_agent.server_args import build_server_args, model_path
+from local_agent.server_args import build_server_args, model_path, split_json_args
 from local_agent.tools import kill_process_tree
 
 OOM_MARKERS = (
@@ -237,13 +238,21 @@ def probe_offload(
     log_path: Path,
 ) -> Trial:
     tuned = profile_with_offload(profile, offload)
-    argv = build_server_args(tuned, port=port)
+    # JSON-valued flags move into LLAMA_ARG_*. The quotes stay in the
+    # environment, which is the launch path start-server.ps1 uses too.
+    argv, extra_env = split_json_args(build_server_args(tuned, port=port))
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_handle = log_path.open("w", encoding="utf-8")
+    for key, value in extra_env.items():
+        log_handle.write(f"# env {key}={value}\n")
+    log_handle.flush()
+    env = os.environ.copy()
+    env.update(extra_env)
     proc = subprocess.Popen(
         [str(exe), *argv],
         stdout=log_handle,
         stderr=subprocess.STDOUT,
+        env=env,
     )
     timed_out = False
     try:

@@ -28,7 +28,12 @@ def main(argv: list[str] | None = None) -> int:
 
     server = sub.add_parser("server-args", help="Print llama-server arguments for a profile.")
     server.add_argument("--profile", required=True)
-    server.add_argument("--format", choices=("json", "lines"), default="json")
+    server.add_argument(
+        "--format",
+        choices=("json", "lines", "launch"),
+        default="json",
+        help="json or lines print the logical argv. launch moves JSON values into LLAMA_ARG_* env vars.",
+    )
     server.add_argument("--allow-missing-model", action="store_true")
     server.add_argument("--host")
     server.add_argument("--port", type=int)

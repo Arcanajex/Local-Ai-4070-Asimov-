@@ -65,6 +65,24 @@ def test_powershell_scripts_exist_and_braces_balance():
         assert "\r" not in text
 
 
+def test_start_server_puts_json_args_in_the_environment_and_logs_them():
+    """PS 5.1 native-arg quoting strips quotes. The launcher must not splat JSON."""
+
+    text = (repo_root() / "scripts" / "start-server.ps1").read_text(encoding="utf-8")
+    assert "'launch'" in text
+    assert 'Set-Item -Path "Env:$name"' in text
+    assert '# env $($prop.Name)=$($prop.Value)' in text
+    assert "server-$Profile-$stamp.argv.txt" in text
+    assert "Out-String -Width" in text
+
+
+def test_tune_spawns_llama_server_with_json_args_in_the_environment():
+    text = (repo_root() / "src" / "local_agent" / "tune.py").read_text(encoding="utf-8")
+    assert "split_json_args" in text
+    assert "env=env" in text
+    assert '# env {key}={value}' in text
+
+
 def test_setup_refuses_wsl_and_downloads_both_cuda_zips():
     text = (repo_root() / "scripts" / "setup.ps1").read_text(encoding="utf-8")
     assert "WSL" in text
