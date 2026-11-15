@@ -8,6 +8,10 @@ kept: the gpt-oss template errors when a tool message has no matching call.
 The original task (the first user message) and the most recent turns stay.
 Older tool output is the first thing to go, which is the failure mode from
 the 8GB bench: a debug loop filled 32K and the server stopped.
+
+Reasoning text is dropped before tool output. Only the most recent assistant
+turns may keep `reasoning_content`; if the prompt is still over budget, the
+rest of that reasoning goes too.
 """
 
 from __future__ import annotations
@@ -23,10 +27,17 @@ def estimate_tokens(messages: list[dict[str, Any]]) -> int:
     return total
 
 
+# A 64K context would otherwise allow a ~49K prompt next to a 16K completion.
+# 32K is about a third more than the old ~24K budget on a 40K context, and it
+# still leaves the 24K retry ceiling inside a 64K window.
+PROMPT_BUDGET_CAP = 32_768
+
+
 def prompt_budget(context_tokens: int, generation_tokens: int, margin: int = 256) -> int:
     """Tokens the prompt may use so the completion still fits."""
 
-    return max(1024, context_tokens - max(generation_tokens, 1) - margin)
+    raw = max(1024, context_tokens - max(generation_tokens, 1) - margin)
+    return min(raw, PROMPT_BUDGET_CAP)
 
 
 def compact_messages(
@@ -35,13 +46,21 @@ def compact_messages(
     *,
     tool_char_limit: int = 12_000,
     keep_last_groups: int = 2,
+    reasoning_keep: int = 0,
 ) -> list[dict[str, Any]]:
     if not messages:
         return []
     msgs = copy.deepcopy(messages)
+    # Old thinking goes first, even when the rest of the prompt still fits.
+    # `reasoning_keep` is how many recent assistant turns may retain it.
+    _strip_reasoning(msgs, keep_last=max(0, reasoning_keep))
     system, groups = _split(msgs)
     _shrink_tools(groups, tool_char_limit)
     flat = _flatten(system, groups)
+    if estimate_tokens(flat) > budget_tokens:
+        _strip_reasoning(flat, keep_last=0)
+        system, groups = _split(flat)
+        flat = _flatten(system, groups)
     if estimate_tokens(flat) <= budget_tokens:
         return flat
 
@@ -112,8 +131,24 @@ def shrink_text(text: str, limit: int) -> str:
     return text[:head] + marker + (text[-tail:] if tail else "")
 
 
+def _strip_reasoning(messages: list[dict[str, Any]], *, keep_last: int) -> None:
+    """Drop `reasoning_content` except on the last `keep_last` assistant messages."""
+
+    assistant_indexes = [
+        index for index, message in enumerate(messages) if message.get("role") == "assistant"
+    ]
+    keep = set(assistant_indexes[-keep_last:]) if keep_last > 0 else set()
+    for index, message in enumerate(messages):
+        if index in keep:
+            continue
+        message.pop("reasoning_content", None)
+
+
 def _message_text(message: dict[str, Any]) -> str:
     parts = [str(message.get("content") or "")]
+    reasoning = message.get("reasoning_content")
+    if reasoning:
+        parts.append(str(reasoning))
     for call in message.get("tool_calls") or []:
         function = call.get("function") or call
         parts.append(str(function.get("name") or ""))

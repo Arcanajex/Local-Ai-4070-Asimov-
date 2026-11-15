@@ -321,3 +321,52 @@ def _sample_completion(base_url: str, profile: Profile) -> float | None:
 
 def sweep_profile(name: str, **kwargs: Any) -> Trial | None:
     return run_sweep(get_profile(name), **kwargs)
+
+
+def check_current_offload(
+    name: str,
+    *,
+    headroom_mib: int = 1024,
+    load_timeout: int = 300,
+    llama_exe: Path | None = None,
+    log_dir: Path | None = None,
+    port: int | None = None,
+) -> Trial:
+    """Load the profile's current offload once and report the VRAM fit.
+
+    Does not write runtime/overrides.json. Stop any server already on the port.
+    """
+
+    profile = get_profile(name)
+    exe = llama_exe or llama_server_path()
+    if not exe.is_file():
+        raise FileNotFoundError(
+            f"llama-server not found at {exe}. Run scripts/setup.ps1 on Windows first."
+        )
+    weights = model_path(profile)
+    if not weights.is_file():
+        raise FileNotFoundError(f"model file not found: {weights}")
+    base_port = port if port is not None else profile.port
+    base_url = f"http://{profile.host}:{base_port}"
+    if server_is_healthy(base_url):
+        raise RuntimeError(
+            f"something is already serving {base_url}. Stop it before the fit check so the "
+            "VRAM sample is this process and not another one."
+        )
+    samples = query_nvidia_smi()
+    gpu = pick_gpu(samples)
+    if gpu is None:
+        raise RuntimeError("nvidia-smi returned no GPU. This check needs the NVIDIA driver.")
+    directory = log_dir or (weights.parent.parent / "logs" / "tune" / profile.name)
+    directory.mkdir(parents=True, exist_ok=True)
+    return probe_offload(
+        profile,
+        profile.offload_value,
+        exe=exe,
+        base_url=base_url,
+        port=base_port,
+        gpu_total_mib=gpu.total_mib,
+        headroom_mib=headroom_mib,
+        load_timeout=load_timeout,
+        log_path=directory / "fit-check.log",
+    )

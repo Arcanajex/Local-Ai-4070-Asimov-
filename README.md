@@ -47,6 +47,40 @@ python -m local_agent validate C:\src\my-app\tasks --project C:\src\my-app
 
 Plug the laptop in before `setup.ps1` downloads anything large, and leave it plugged in for every server and overnight run.
 
+## What changed / how to run a long session
+
+This pass is about a run you can leave overnight. Sampling (temperature, top-p, top-k, repeat penalty) is unchanged.
+
+- `quality` context is 65536. `--reasoning-budget` is 10240 so a thinking trace cannot consume the whole 16384 `max_tokens` and come back empty. Both are overridable in `runtime\overrides.json`.
+- The prompt budget is capped at 32768 tokens (it was about 24000 on the old 40K window). The review diff cap is 32000 characters.
+- Qwen profiles send `--chat-template-kwargs {"preserve_thinking":true}` and replay `reasoning_content` for the last 2 assistant turns in a phase. Older reasoning is dropped before tool output is trimmed. `day` (gpt-oss) does not replay reasoning.
+- Optional `smoke_command` runs after the tests. `smoke_mode: launch` starts a GUI or a server, waits (default 6 seconds), treats "still running, no traceback" as a pass, and kills the process tree.
+- `test_first: true` / `--test-first` / `-TestFirst` writes tests first and locks them. Default off: a bad locked test cannot be repaired in the fix loop.
+- The queue retries once (`-Retries 1`, `--retries 1`) from a fresh `agent/<slug>-r2` branch when the iteration budget, a loop, or the review fails. A single overnight run does not retry unless you pass `-Retries`. The stop file is checked between attempts. Archive only happens when an attempt passes.
+- `python -m local_agent eval --mock` checks the fixture checkers with no server. `--profile quality` runs them against the live server.
+
+On the laptop, after you pull, before the long queue:
+
+```powershell
+# Stop llama-server first. Re-tune: the context is 64K now, so the old VRAM winner may not fit.
+.\scripts\tune-n-cpu-moe.ps1 -Profile quality
+
+# One load of the current offload. Does not write overrides. memory.used should stay ~1 GB under 8 GB.
+.\scripts\tune-n-cpu-moe.ps1 -Profile quality -Check
+
+.\scripts\start-server.ps1 -Profile quality
+.\scripts\smoke-test.ps1 -Live -Profile quality
+
+# Plumbing only, no GPU. Then the live scoreboard if you want a longer signal.
+python -m local_agent eval --mock
+python -m local_agent eval --profile quality
+
+python -m local_agent validate C:\src\my-app\tasks --project C:\src\my-app
+.\scripts\queue.ps1 -TaskDir C:\src\my-app\tasks -Project C:\src\my-app -Profile quality
+```
+
+Put `smoke_command` on GUI tasks (`smoke_mode: launch`). Leave `-TestFirst` off unless the task asks for it. `-Retries 1` is already the queue default. Create `runtime\STOP_QUEUE` from another window (`.\scripts\stop-queue.ps1`) to finish the current attempt and start nothing else.
+
 To install the toolchain without the weights (about 1 GB instead of about 35 GB):
 
 ```powershell
@@ -78,7 +112,7 @@ This repo keeps that tool surface and does not vendor Pi or turn on llama.cpp's 
 - Every shell command has a timeout. A blocking command (`tail -f`, a server, a prompt) otherwise hangs the run until morning.
 - The same tool call three times gets a warning. The fourth identical call, or an A-B-A-B oscillation, ends the phase.
 - Old turns are dropped as whole tool-call groups so the prompt stays inside the context window. A tool result is never kept without its call.
-- Thinking text is logged and is not sent back on the next turn. Replaying it is what filled the 32K window in the bench.
+- Thinking text is logged. Qwen profiles send `reasoning_content` back for the last two assistant turns in the phase. Older reasoning is dropped before tool output is trimmed. gpt-oss does not get reasoning replay; its template does not use that field.
 - If a turn comes back empty because `finish_reason` is `length`, the harness retries once at the profile's higher token ceiling, then nudges the model once. Thinking models spend the budget inside the trace and return no `content` when `max_tokens` is small.
 - The overnight runner, not the model, executes the test command, writes `AGENT_REPORT.md`, and commits. The model is told not to `git commit` or `git push`.
 
@@ -90,7 +124,7 @@ Checked on 2026-11-10 against Hugging Face (`x-linked-size`) and the llama.cpp s
 
 | Profile | When to use | Weights | File size | Context | Offload | Generation budget |
 | --- | --- | --- | --- | --- | --- | --- |
-| `quality` | Overnight. Accuracy over speed. | [`unsloth/Qwen3.6-35B-A3B-GGUF`](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` | 22,134,528,992 bytes (22.1 GB) | 40960 | `--n-cpu-moe 34` | 16384, retry 24576 |
+| `quality` | Overnight. Accuracy over speed. | [`unsloth/Qwen3.6-35B-A3B-GGUF`](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` | 22,134,528,992 bytes (22.1 GB) | 65536 | `--n-cpu-moe 34` | 16384, retry 24576, reasoning budget 10240 |
 | `day` | Daytime agent loops. The bench's reliable pick. | [`ggml-org/gpt-oss-20b-GGUF`](https://huggingface.co/ggml-org/gpt-oss-20b-GGUF) `gpt-oss-20b-MXFP4.gguf` | 12,109,566,624 bytes (12.1 GB) | 32768 | `--n-cpu-moe 30` | 8192, retry 16384 |
 | `max` | Optional. Dense 27B, slow. | [`ggml-org/Qwen3.8-27B-GGUF`](https://huggingface.co/ggml-org/Qwen3.8-27B-GGUF) `Qwen3.8-27B-Q4_K_M.gguf` | 19,403,684,480 bytes (19.4 GB) | 16384 | `--n-cpu-ffn 64` | 16384, retry 24576 |
 
@@ -118,7 +152,7 @@ These are built by `python -m local_agent server-args` and passed through by `st
 - `--jinja`. Tool calling uses the chat template stored in the GGUF. Current llama-server builds default this on; the flag is still passed.
 - `--flash-attn on` and `--cache-type-k q8_0 --cache-type-v q8_0`. Quantized KV needs flash attention on CUDA.
 - `--batch-size 512 --ubatch-size 512`. A 2048 ubatch is faster and is what the gpt-oss guide uses on larger cards. It also grows the CUDA compute buffer, which is a common OOM on 8 GB.
-- `--reasoning on`. `quality` and `max` also pass `--reasoning-budget -1` (no cap inside the template). `day` passes `--reasoning-effort medium`. `max` passes `--reasoning-effort high` rather than the template's `xhigh` default, so a turn can finish inside the token budget.
+- `--reasoning on`. `quality` passes `--reasoning-budget 10240` (llama.cpp b12110: `-1` unrestricted, `0` ends thinking immediately, `N>0` is a token cap) so the trace cannot eat the whole completion. `max` still passes `--reasoning-budget -1`. `day` passes `--reasoning-effort medium`. `max` passes `--reasoning-effort high` rather than the template's `xhigh` default, so a turn can finish inside the token budget. `quality` and `max` also pass `--chat-template-kwargs {"preserve_thinking":true}`. That key is the Qwen template's switch for keeping prior thinking; gpt-oss does not get it. If a future llama.cpp build rejects the key, set `"preserve_thinking": false` in `runtime\overrides.json`.
 - Sampling: Qwen profiles use temperature 0.6, top-p 0.95, top-k 20, repeat penalty 1.0. gpt-oss uses temperature 1.0 and top-p 1.0, which is the sampling the model was released with. Repeat penalty above 1.0 tends to damage thinking traces, so it stays at 1.0.
 
 ## Install from scratch on Windows 11
@@ -217,7 +251,9 @@ For each candidate in the profile (`quality`: 40, 36, 34, 32, 30; `day`: 30, 24,
 }
 ```
 
-Allowed keys include `n_cpu_moe`, `n_cpu_ffn`, `context`, `flash_attn`, `batch_size`, `ubatch_size`, `temperature`, `reasoning`, `reasoning_budget`, `reasoning_effort`, `agent_max_tokens`, `agent_max_tokens_ceiling`, `port`, and `host`.
+Allowed keys include `n_cpu_moe`, `n_cpu_ffn`, `context`, `flash_attn`, `batch_size`, `ubatch_size`, `temperature`, `reasoning`, `reasoning_budget`, `reasoning_effort`, `preserve_thinking`, `reasoning_replay_turns`, `agent_max_tokens`, `agent_max_tokens_ceiling`, `port`, and `host`.
+
+After the quality context moved from 40960 to 65536, run the tuner again. KV cache grows with context, and the offload that fit at 40K can sit on the cap at 64K. `.\scripts\tune-n-cpu-moe.ps1 -Profile quality -Check` loads the current offload once, does not write `overrides.json`, and fails if dedicated VRAM minus the headroom (default 1024 MiB) is exceeded. The full sweep is `.\scripts\tune-n-cpu-moe.ps1 -Profile quality`. During a successful check, `nvidia-smi` memory.used should stay about 1 GB under the 8 GB total.
 
 ## Run the server
 
@@ -280,7 +316,7 @@ Logs:
 
 ## Project context and the task template
 
-The target repo should have an `AGENTS.md` at its root. That file, plus any paths named in a task's `context:` front matter, is inlined as a **Project context** block at the start of every phase (plan, implement, fix, review). The block is capped at 14,000 characters. When a file is cut, the block says `[truncated - read <path> for the rest]` and still lists every path so the model can read the remainder. Compaction keeps the first user message, so this block is not dropped when tool output is trimmed.
+The target repo should have an `AGENTS.md` at its root. That file, plus any paths named in a task's `context:` front matter, is inlined as a **Project context** block at the start of every phase (plan, implement, fix, review). The block is capped at 14,000 characters. A short Python repo map (modules, classes, functions, about 6,000 characters) is appended when the tree has Python files. When a file is cut, the block says `[truncated - read <path> for the rest]` and still lists every path so the model can read the remainder. Compaction keeps the first user message, so this block is not dropped when tool output is trimmed. The prompt itself is capped at 32,768 estimated tokens even though the quality context is 65,536, so the completion still has room.
 
 Write tasks with [docs/TASK_TEMPLATE.md](docs/TASK_TEMPLATE.md). Required headings are `Goal`, `Acceptance criteria`, and `Out of scope`. A non-Python repo must set `test_command`. A Python repo that omits it uses `python -m pytest -q`.
 
@@ -419,7 +455,7 @@ Prefill on a long agent prompt is slower than the decode number. The generation 
 
 **Empty replies, or the agent says the model returned nothing.** This is the thinking-model failure mode. The trace consumed `max_tokens` and `content` is empty. The harness already retries at `agent_max_tokens_ceiling` and then sends one short nudge. If it still happens:
 
-- Confirm the server was started by `start-server.ps1`. A hand-built command with `-n 512` or `--reasoning-budget 0` will empty every turn.
+- Confirm the server was started by `start-server.ps1`. A hand-built command with `-n 512` or `--reasoning-budget 0` will empty every turn. The shipped quality budget is 10240, which leaves room under `max_tokens` for the tool call. Raise it in `runtime\overrides.json` only if turns are cut off mid-thought, and keep it under `agent_max_tokens`.
 - In `runtime\overrides.json`, raise `agent_max_tokens` and `agent_max_tokens_ceiling`. Keep their sum under `context` minus a few thousand tokens of prompt.
 - For a faster daytime loop where you do not need the trace, set `"reasoning": "off"` on `quality`. The bench found thinking off about 2.7x faster on the easy task, and the tool calls still worked. Overnight quality runs should leave reasoning on.
 
@@ -470,9 +506,13 @@ From any machine with Python 3.11+ and git, no GPU required:
 python -m pip install -e ".[dev]"
 python -m pytest -q
 python -m local_agent smoke --mock
+python -m local_agent eval --mock
+python -m local_agent eval --mock --only off-by-one
 ```
 
-GitHub Actions runs that on Ubuntu. The PowerShell scripts are checked for balanced braces and for `ErrorActionPreference = 'Stop'`. They are not executed in CI. Run `.\scripts\smoke-test.ps1` once on the laptop after setup.
+`eval --mock` does not load a model. It checks that each fixture under `evals/` fails its hidden checker on the starter tree and passes on the reference solution. `python -m local_agent eval --profile quality` runs those tasks against a server you already started and writes `runtime/evals/scoreboard-*.json`. `--only name` runs one fixture. Live evals are not part of CI.
+
+GitHub Actions runs the unit tests, the mock smoke, and `eval --mock` on Ubuntu. The PowerShell scripts are checked for balanced braces and for `ErrorActionPreference = 'Stop'`. They are not executed in CI. Run `.\scripts\smoke-test.ps1` once on the laptop after setup.
 
 Useful module entry points, which the scripts call:
 
@@ -487,6 +527,8 @@ python -m local_agent overnight --task tasks/smoke-task.md --project <git-repo> 
 python -m local_agent archive tasks/ui/step-2.md
 python -m local_agent stop
 python -m local_agent stop --cancel
+python -m local_agent eval --mock
+python -m local_agent eval --profile quality --only tkinter-launch
 ```
 
 ## What was not run on an RTX 4070
@@ -498,6 +540,7 @@ Before trusting a long unattended job on the Legion:
 1. `nvidia-smi` shows the 4070 and a current driver.
 2. `.\scripts\setup.ps1` finishes, including both CUDA zips.
 3. `.\scripts\smoke-test.ps1` passes (mock).
-4. `.\scripts\tune-n-cpu-moe.ps1 -Profile quality` finishes and `nvidia-smi` during a successful candidate stays about 1 GB under the dedicated total.
+4. `.\scripts\tune-n-cpu-moe.ps1 -Profile quality` finishes and `nvidia-smi` during a successful candidate stays about 1 GB under the dedicated total. After this repo's context change, run that tune again, or `.\scripts\tune-n-cpu-moe.ps1 -Profile quality -Check` for a single load of the current offload.
 5. `.\scripts\smoke-test.ps1 -Live -Profile quality` passes.
-6. Then point `overnight.ps1` at a real repository.
+6. `python -m local_agent eval --mock` passes, then `python -m local_agent eval --profile quality` if you want the fixture scoreboard.
+7. Then point `overnight.ps1` or `queue.ps1` at a real repository. The queue retries a failed task once. Pass `-Retries 0` to disable that.

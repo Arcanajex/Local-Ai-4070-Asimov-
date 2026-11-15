@@ -150,15 +150,18 @@ def _maybe_json(text: str) -> Any:
     return text
 
 
-def assistant_message(result: ChatResult) -> dict[str, Any]:
+def assistant_message(result: ChatResult, *, include_reasoning: bool = False) -> dict[str, Any]:
     """History entry for the next request.
 
-    Reasoning is intentionally omitted. Replaying a multi-thousand-token
-    thinking trace on every turn is what pushed the 35B model past 32K in
-    the 8GB bench, and the gpt-oss template drops previous analysis anyway.
+    Reasoning is omitted unless this turn is one of the few the profile
+    replays. Sending every thinking trace back is what pushed the 35B model
+    past 32K in the 8GB bench. The gpt-oss template does not use
+    `reasoning_content`, so that profile leaves `include_reasoning` false.
     """
 
     message: dict[str, Any] = {"role": "assistant", "content": result.content or ""}
+    if include_reasoning and result.reasoning:
+        message["reasoning_content"] = result.reasoning
     if result.tool_calls:
         message["tool_calls"] = [
             {

@@ -18,3 +18,5 @@ jobs:
         run: python -m pytest -q
       - name: Mock smoke via the CLI
         run: python -m local_agent smoke --mock
+      - name: Mock eval plumbing
+        run: python -m local_agent eval --mock

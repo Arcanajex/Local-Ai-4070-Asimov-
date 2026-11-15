@@ -90,6 +90,16 @@ def build_server_args(
         args.extend(["--reasoning-budget", str(profile.reasoning_budget)])
     if profile.reasoning_effort:
         args.extend(["--reasoning-effort", profile.reasoning_effort])
+    # Qwen templates keep prior `reasoning_content` only when the template is
+    # told to. gpt-oss does not use this key; leave it off there. The flag
+    # name is `--chat-template-kwargs` (a JSON object) on llama.cpp b12110.
+    if profile.preserve_thinking:
+        args.extend(
+            [
+                "--chat-template-kwargs",
+                json.dumps({"preserve_thinking": True}, separators=(",", ":")),
+            ]
+        )
     return args
 
 

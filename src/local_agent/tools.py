@@ -139,6 +139,9 @@ class Workspace:
         self.root = Path(root).resolve()
         if not self.root.is_dir():
             raise FileNotFoundError(f"project root does not exist: {self.root}")
+        # rel posix path -> exact bytes. Test-first files live here so a later
+        # phase cannot edit or delete them. Empty unless a phase locks files.
+        self.locked: dict[str, bytes] = {}
 
     def resolve(self, raw_path: str) -> Path:
         if not isinstance(raw_path, str) or not raw_path.strip():
@@ -176,9 +179,57 @@ class Workspace:
             body += "\n[file continues; read again with a higher offset]"
         return ToolResult(True, header + "\n" + body)
 
+    def lock_files(self, rels: list[str]) -> list[str]:
+        """Remember the current bytes of these project-relative paths."""
+
+        locked: list[str] = []
+        for rel in rels:
+            target = (self.root / rel).resolve()
+            try:
+                target.relative_to(self.root)
+            except ValueError:
+                continue
+            if not target.is_file():
+                continue
+            stored = target.relative_to(self.root).as_posix()
+            self.locked[stored] = target.read_bytes()
+            locked.append(stored)
+        return locked
+
+    def restore_locked(self) -> list[str]:
+        """Write locked bytes back when a tool changed or deleted the file."""
+
+        restored: list[str] = []
+        for rel, content in self.locked.items():
+            path = self.root / rel
+            current = path.read_bytes() if path.is_file() else None
+            if current == content:
+                continue
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+            restored.append(rel)
+        return restored
+
+    def _reject_locked(self, raw_path: str) -> ToolResult | None:
+        try:
+            target = self.resolve(raw_path)
+            rel = target.relative_to(self.root).as_posix()
+        except ValueError:
+            return None
+        if rel in self.locked:
+            return ToolResult(
+                False,
+                f"refusing to change {rel}: it is a test-first file and is locked. "
+                "Fix the implementation so these tests pass. Do not edit or delete them.",
+            )
+        return None
+
     def write(self, path: str, content: str) -> ToolResult:
         if not isinstance(content, str):
             return ToolResult(False, "content must be a string")
+        rejected = self._reject_locked(path)
+        if rejected is not None:
+            return rejected
         encoded = content.encode("utf-8")
         if len(encoded) > MAX_WRITE_BYTES:
             return ToolResult(False, f"refusing to write {len(encoded)} bytes (limit {MAX_WRITE_BYTES})")
@@ -196,6 +247,9 @@ class Workspace:
         return ToolResult(True, f"wrote {path} ({len(text.encode('utf-8'))} bytes)")
 
     def edit(self, path: str, old_string: str, new_string: str) -> ToolResult:
+        rejected = self._reject_locked(path)
+        if rejected is not None:
+            return rejected
         if not isinstance(old_string, str) or not isinstance(new_string, str):
             return ToolResult(False, "old_string and new_string must be strings")
         if old_string == "":
