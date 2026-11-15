@@ -6,6 +6,9 @@
 .DESCRIPTION
   The argument list is built by `python -m local_agent server-args` so the
   flags in the README, the tuner, and this launcher cannot drift apart.
+  JSON object values come back from `--format launch` as LLAMA_ARG_*
+  environment variables. Windows PowerShell 5.1 strips embedded double
+  quotes from native arguments, and llama-server then rejects the JSON.
   The process stays in the foreground unless -Background is set. Listen
   address is 127.0.0.1. Overrides in runtime\overrides.json are applied.
 
@@ -49,7 +52,7 @@ $InstallDir = Get-InstallDir $InstallDir
 $python = Get-VenvPython $InstallDir
 $exe = Get-LlamaServerExe $InstallDir
 
-$argList = @('-m', 'local_agent', 'server-args', '--profile', $Profile, '--format', 'json')
+$argList = @('-m', 'local_agent', 'server-args', '--profile', $Profile, '--format', 'launch')
 if ($Port -gt 0) {
     $argList += @('--port', "$Port")
 }
@@ -57,22 +60,52 @@ $raw = & $python @argList
 if ($LASTEXITCODE -ne 0) {
     throw "Could not build llama-server arguments for profile $Profile."
 }
-$serverArgs = @((($raw | Out-String).Trim() | ConvertFrom-Json))
+$payload = (($raw | Out-String -Width 16384).Trim() | ConvertFrom-Json)
+if ($null -eq $payload.args) {
+    throw "server-args --format launch did not return arguments for profile $Profile."
+}
+$serverArgs = @($payload.args)
+
+# Apply every env entry from the launch payload. PowerShell 5.1 and pwsh 7
+# both take this path. The quotes stay in the environment block; they never
+# cross the native command line, where 5.1 would strip them.
+$envProps = @()
+if ($null -ne $payload.env) {
+    $envProps = @($payload.env.PSObject.Properties)
+}
+$envNotes = @()
+foreach ($prop in $envProps) {
+    $envNotes += "# env $($prop.Name)=$($prop.Value)"
+}
 
 $logDir = Join-Path $InstallDir 'logs'
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $argvPath = Join-Path $logDir "server-$Profile-$stamp.argv.txt"
-@($exe) + $serverArgs | Set-Content -LiteralPath $argvPath -Encoding UTF8
+@($exe) + $serverArgs + $envNotes | Set-Content -LiteralPath $argvPath -Encoding UTF8
 Write-Host "Command saved to $argvPath"
+foreach ($note in $envNotes) {
+    Write-Host $note
+}
 Write-Host "Starting $exe"
 Write-Host "Profile: $Profile"
 Write-Host 'The API is http://127.0.0.1:<port>/v1  (health: /health). Ctrl+C stops the server.'
 
 $binDir = Split-Path -Parent $exe
 $code = 0
+$envToRestore = @{}
+$envToRemove = @()
 Push-Location $binDir
 try {
+    foreach ($prop in $envProps) {
+        $name = [string]$prop.Name
+        if (Test-Path -Path "Env:$name") {
+            $envToRestore[$name] = [string](Get-Item -Path "Env:$name").Value
+        } else {
+            $envToRemove += $name
+        }
+        Set-Item -Path "Env:$name" -Value ([string]$prop.Value)
+    }
     # The CUDA DLLs sit next to the exe. Windows searches that directory
     # when the executable path is absolute, which it is.
     & $exe @serverArgs
@@ -81,6 +114,12 @@ try {
     }
 } finally {
     Pop-Location
+    foreach ($name in @($envToRestore.Keys)) {
+        Set-Item -Path "Env:$name" -Value ([string]$envToRestore[$name])
+    }
+    foreach ($name in @($envToRemove)) {
+        Remove-Item -Path "Env:$name" -ErrorAction SilentlyContinue
+    }
 }
 if ($code -ne 0) {
     throw "llama-server exited with code $code. See the console output above. Common causes are in the README under Troubleshooting."
