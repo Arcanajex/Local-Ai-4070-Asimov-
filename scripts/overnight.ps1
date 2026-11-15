@@ -32,6 +32,17 @@
   How many times the runner may execute the test command and hand a failure
   back to the model. Default 6.
 
+.PARAMETER Retries
+  Extra attempts from the original branch after the iteration budget, a
+  detected loop, or a failed review. Default 0. The queue defaults to 1.
+
+.PARAMETER TestFirst
+  Write tests from the acceptance criteria before implementing, then lock
+  those files. Overrides a task that does not set test_first.
+
+.PARAMETER NoTestFirst
+  Skip the test-first phase even when the task sets test_first.
+
 .PARAMETER ArchiveDir
   When the run passes, move the task file here. Default is tasks\archive
   in this repo. The path under the tasks root is kept.
@@ -52,6 +63,9 @@ param(
     [string]$TasksRoot = '',
     [double]$MaxHours = 8,
     [int]$MaxIterations = 6,
+    [int]$Retries = 0,
+    [switch]$TestFirst,
+    [switch]$NoTestFirst,
     [int]$Port = 8080,
     [switch]$NoStayAwake,
     [switch]$SkipPerformancePlan,
@@ -68,6 +82,9 @@ Set-StrictMode -Version Latest
 Assert-NativeWindows
 if ($NoArchive -and $ArchiveDir) {
     throw '-NoArchive and -ArchiveDir cannot be used together.'
+}
+if ($TestFirst -and $NoTestFirst) {
+    throw '-TestFirst and -NoTestFirst cannot be used together.'
 }
 $InstallDir = Get-InstallDir $InstallDir
 $python = Get-VenvPython $InstallDir
@@ -154,6 +171,7 @@ try {
         '--base-url', $base,
         '--max-hours', "$MaxHours",
         '--max-iterations', "$MaxIterations",
+        '--retries', "$Retries",
         '--log-dir', (Join-Path $logDir ('run-{0}' -f (Get-Date -Format 'yyyyMMdd-HHmmss')))
     )
     if ($InitRepo) {
@@ -161,6 +179,12 @@ try {
     }
     if ($NoStrict) {
         $agentArgs += '--no-strict'
+    }
+    if ($TestFirst) {
+        $agentArgs += '--test-first'
+    }
+    if ($NoTestFirst) {
+        $agentArgs += '--no-test-first'
     }
     if ($NoArchive) {
         $agentArgs += '--no-archive'

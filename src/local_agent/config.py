@@ -36,6 +36,8 @@ OVERRIDABLE = {
     "parallel",
     "cache_type_k",
     "cache_type_v",
+    "preserve_thinking",
+    "reasoning_replay_turns",
 }
 
 
@@ -83,6 +85,8 @@ class Profile:
     n_cpu_ffn: int | None = None
     reasoning_budget: int | None = None
     reasoning_effort: str | None = None
+    preserve_thinking: bool = False
+    reasoning_replay_turns: int = 0
     total_params_b: float | None = None
     active_params_b: float | None = None
     notes: str = ""
@@ -139,6 +143,12 @@ def load_overrides(path: Path | None = None) -> dict[str, dict[str, Any]]:
     return cleaned
 
 
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
 def _as_int(value: Any, key: str) -> int:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{key} must be a number, got {value!r}")
@@ -180,6 +190,8 @@ def profile_from_dict(name: str, data: dict[str, Any], defaults: dict[str, Any])
         reasoning_effort=(
             str(merged["reasoning_effort"]) if merged.get("reasoning_effort") else None
         ),
+        preserve_thinking=_as_bool(merged.get("preserve_thinking", False)),
+        reasoning_replay_turns=_as_int(merged.get("reasoning_replay_turns", 0), "reasoning_replay_turns"),
         temperature=float(merged.get("temperature", 0.6)),
         top_p=float(merged.get("top_p", 0.95)),
         top_k=_as_int(merged.get("top_k", 20), "top_k"),

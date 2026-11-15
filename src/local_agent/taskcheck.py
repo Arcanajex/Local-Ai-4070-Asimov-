@@ -45,9 +45,30 @@ _PLAIN_HEADINGS = {
     "open questions policy",
     "correctness",
     "tests",
+    "tests vs criteria",
     "risks",
     "verdict",
 }
+
+# Substrings that mean a task launches a window, a GUI toolkit, or a server.
+# "gui" is a word, not a prefix, so "guide" does not match.
+_APP_MARKERS = (
+    "tkinter",
+    "pyqt",
+    "pyside",
+    "wxpython",
+    "kivy",
+    "pygame",
+    "customtkinter",
+    "dearpygui",
+    "flask",
+    "fastapi",
+    "uvicorn",
+    "streamlit",
+    "gradio",
+    "desktop app",
+    "main window",
+)
 
 
 def _heading(line: str) -> tuple[int, str] | None:
@@ -114,6 +135,36 @@ def project_is_python(project: Path) -> bool:
     return True
 
 
+def looks_like_app_task(task: Any) -> bool:
+    """True when the task text is about a GUI or a long-running app."""
+
+    text = f"{getattr(task, 'title', '')}\n{getattr(task, 'body', '')}".lower()
+    if any(marker in text for marker in _APP_MARKERS):
+        return True
+    return re.search(r"\bgui\b", text) is not None
+
+
+def validate_task_warnings(task: Any, project: Path | None = None) -> list[str]:
+    """Warnings that do not refuse the run.
+
+    A GUI or server task with no smoke command is the one we can detect.
+    Other tasks are documented in docs/TASK_TEMPLATE.md and stay quiet.
+    """
+
+    label = task.path.name if getattr(task, "path", None) else task.title or "task"
+    command = getattr(task, "smoke_command", None) or ""
+    if not command and project is not None:
+        from local_agent.overnight import agents_front_matter
+
+        command = agents_front_matter(project).get("smoke_command", "")
+    if command or not looks_like_app_task(task):
+        return []
+    return [
+        f"{label}: warning: this looks like a GUI or app task and has no smoke_command. "
+        "Add smoke_command (smoke_mode: launch for a window or a server) so a crash fails the run."
+    ]
+
+
 def validate_task(task: Any, project: Path) -> list[str]:
     label = task.path.name if task.path else task.title or "task"
     problems: list[str] = []
@@ -126,6 +177,19 @@ def validate_task(task: Any, project: Path) -> list[str]:
             "(Python projects default to pytest)"
         )
     return problems
+
+
+def warning_task_files(paths: list[Path], project: Path) -> list[str]:
+    from local_agent.overnight import load_task
+
+    warnings: list[str] = []
+    for path in paths:
+        try:
+            task = load_task(path)
+        except OSError:
+            continue
+        warnings.extend(validate_task_warnings(task, project))
+    return warnings
 
 
 def validate_task_files(paths: list[Path], project: Path) -> list[str]:
@@ -161,7 +225,7 @@ def collect_task_paths(target: Path) -> list[Path]:
     raise FileNotFoundError(f"task path does not exist: {target}")
 
 
-def review_problems(text: str) -> list[str]:
+def review_problems(text: str, *, require_test_coverage: bool = False) -> list[str]:
     """Reasons the self-review must trigger a fix instead of a merge.
 
     A criterion marked 'not met', a real conflict, or a missing required
@@ -186,6 +250,15 @@ def review_problems(text: str) -> list[str]:
             problems.append(f"conflict: {first[:200]}")
     if re.search(r"(?im)^verdict:\s*fix\b", text):
         problems.append("verdict: fix")
+    if require_test_coverage:
+        if not heading_exists(text, "Tests vs criteria"):
+            problems.append("review omitted the Tests vs criteria section")
+        else:
+            section = extract_section(text, "Tests vs criteria")
+            if re.search(r"(?im)^coverage:\s*gap\b", section):
+                problems.append("test-first coverage: gap")
+            elif not re.search(r"(?im)^coverage:\s*ok\b", section):
+                problems.append("review omitted Coverage: ok or Coverage: gap")
     return problems
 
 

@@ -9,6 +9,9 @@ folder before the first task starts.
 ---
 test_command: python -m pytest -q
 lint_command: python -m ruff check .
+smoke_command: python app.py
+smoke_mode: launch
+smoke_launch_seconds: 6
 context:
   - src/app.py
   - docs/decisions.md
@@ -56,7 +59,17 @@ contradicts `AGENTS.md` or this file fails the self-review.
 | --- | --- | --- |
 | `test_command` | Yes, unless the target repo is Python | Command the runner executes. Python repos that omit it use `python -m pytest -q`. |
 | `lint_command` | No | Runs only after the tests pass. |
+| `smoke_command` | No | Runs after the tests pass. A nonzero exit or a Python traceback fails the iteration and is pasted into the fix prompt. |
+| `smoke_mode` | No | `run` (default) waits for the command. `launch` is for a GUI or a server: start it, wait `smoke_launch_seconds` (default 6), treat still-running with no traceback as a pass, then kill the process tree. An exit during that wait is a crash. |
+| `smoke_timeout` | No | Seconds for `smoke_mode: run`. Default 120, maximum 600. |
+| `smoke_launch_seconds` | No | Seconds to wait in `launch` mode. Default 6. Clamped to 1–60. |
+| `smoke_fail_on_traceback` | No | Default true. Set `false` to ignore a traceback in the output. |
+| `test_first` | No | `true` writes tests from the acceptance criteria before implementation and locks those files. Default off. The CLI flags are `--test-first` and `--no-test-first` (`-TestFirst`, `-NoTestFirst`). |
 | `context` | No | Repo-relative files inlined into the Project context block, after `AGENTS.md`. A YAML list or a comma-separated line. |
+
+The same smoke keys can sit in the front matter of the target repo's `AGENTS.md`. A key set on the task wins. `validate` prints a warning, and still exits 0, when a task mentions a GUI toolkit or a server and neither the task nor `AGENTS.md` sets `smoke_command`. Other tasks are not warned about.
+
+A task or queue run can also pass `--retries N` (`-Retries`). The queue default is 1. A single overnight run defaults to 0. A retry starts a clean branch `agent/<slug>-r2` from the original base after the iteration budget, a detected loop, or a failed review. The stop file is checked between attempts. The task file is archived only when an attempt passes.
 
 ## Required headings
 

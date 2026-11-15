@@ -21,13 +21,23 @@
 
 .EXAMPLE
   .\scripts\tune-n-cpu-moe.ps1 -Profile day -HeadroomMib 1536
+
+.EXAMPLE
+  .\scripts\tune-n-cpu-moe.ps1 -Profile quality -Check
+
+.PARAMETER Check
+  Load the current offload once and print whether VRAM stays under the
+  headroom. Does not write runtime\overrides.json. Use this after a context
+  change, before a long run, to confirm memory.used is about 1 GB under the
+  dedicated total.
 #>
 [CmdletBinding()]
 param(
     [string]$Profile = 'quality',
     [string]$InstallDir = '',
     [int]$HeadroomMib = 1024,
-    [int]$LoadTimeout = 300
+    [int]$LoadTimeout = 300,
+    [switch]$Check
 )
 
 $ErrorActionPreference = 'Stop'
@@ -38,10 +48,23 @@ Assert-NativeWindows
 $InstallDir = Get-InstallDir $InstallDir
 $python = Get-VenvPython $InstallDir
 
-Write-Host "Tuning $Profile. Headroom ${HeadroomMib} MiB. This reloads the model for each candidate."
+$tuneArgs = @('-m', 'local_agent', 'tune', '--profile', $Profile, '--headroom-mib', "$HeadroomMib", '--load-timeout', "$LoadTimeout")
+if ($Check) {
+    Write-Host "Fit check for $Profile at the current offload. Headroom ${HeadroomMib} MiB. Overrides are not changed."
+    $tuneArgs += '--check'
+} else {
+    Write-Host "Tuning $Profile. Headroom ${HeadroomMib} MiB. This reloads the model for each candidate."
+}
 Write-Host 'Plug the laptop in. Set Legion performance mode. Close games and browsers.'
-& $python -m local_agent tune --profile $Profile --headroom-mib $HeadroomMib --load-timeout $LoadTimeout
+& $python @tuneArgs
 if ($LASTEXITCODE -ne 0) {
+    if ($Check) {
+        throw "Fit check failed for $Profile. VRAM is over the cap, or the server did not stay up. Raise n_cpu_moe or lower context in runtime\overrides.json, then run the full tune."
+    }
     throw "Tuning failed for $Profile. If every candidate OOMs, lower the profile context in runtime\overrides.json and run this again."
 }
-Write-Host 'Wrote runtime\overrides.json. The next start-server.ps1 uses it.'
+if ($Check) {
+    Write-Host 'Fit check passed. nvidia-smi memory.used during the check should be about 1 GB under the dedicated total.'
+} else {
+    Write-Host 'Wrote runtime\overrides.json. The next start-server.ps1 uses it.'
+}

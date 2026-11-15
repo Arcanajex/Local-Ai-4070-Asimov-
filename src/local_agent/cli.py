@@ -13,7 +13,7 @@ from local_agent.config import get_profile, list_profiles
 from local_agent.download import DownloadError, download_file
 from local_agent.archive import archive_task, maybe_archive_task
 from local_agent.control import cancel_stop, request_stop
-from local_agent.overnight import load_task, make_client, run_overnight
+from local_agent.overnight import load_task, make_client, run_with_retries as run_overnight
 from local_agent.queue import run_queue
 from local_agent.paths import runtime_dir
 from local_agent.releases import resolve_windows_cuda_plan
@@ -60,6 +60,22 @@ def main(argv: list[str] | None = None) -> int:
     overnight.add_argument("--log-dir", type=Path)
     overnight.add_argument("--max-hours", type=float, default=8.0)
     overnight.add_argument("--max-iterations", type=int, default=6)
+    overnight.add_argument(
+        "--retries",
+        type=int,
+        default=0,
+        help="Extra attempts from the original branch after iteration_budget, loop_detected, or review_failed. Default 0.",
+    )
+    overnight.add_argument(
+        "--test-first",
+        action="store_true",
+        help="Write tests from the acceptance criteria before implementing, then lock those files.",
+    )
+    overnight.add_argument(
+        "--no-test-first",
+        action="store_true",
+        help="Do not run a test-first phase, even when the task sets test_first.",
+    )
     overnight.add_argument("--test-command")
     overnight.add_argument("--lint-command")
     overnight.add_argument(
@@ -98,6 +114,22 @@ def main(argv: list[str] | None = None) -> int:
     queue.add_argument("--log-dir", type=Path)
     queue.add_argument("--max-hours-per-task", type=float, default=8.0)
     queue.add_argument("--max-iterations", type=int, default=6)
+    queue.add_argument(
+        "--retries",
+        type=int,
+        default=1,
+        help="Extra attempts per task after iteration_budget, loop_detected, or review_failed. Default 1. Use 0 to disable.",
+    )
+    queue.add_argument(
+        "--test-first",
+        action="store_true",
+        help="Force a test-first phase on every task.",
+    )
+    queue.add_argument(
+        "--no-test-first",
+        action="store_true",
+        help="Do not run a test-first phase, even when a task sets test_first.",
+    )
     queue.add_argument(
         "--init-repo",
         action="store_true",
@@ -177,7 +209,22 @@ def main(argv: list[str] | None = None) -> int:
     tune.add_argument("--profile", required=True)
     tune.add_argument("--headroom-mib", type=int, default=1024)
     tune.add_argument("--load-timeout", type=int, default=300)
+    tune.add_argument(
+        "--check",
+        action="store_true",
+        help="Load the current offload once and report whether VRAM stays under the cap. Does not write overrides.",
+    )
     tune.set_defaults(func=_tune)
+
+    evaluate = sub.add_parser("eval", help="Run the eval fixtures against llama-server, or --mock for plumbing.")
+    evaluate.add_argument("--profile", default="quality")
+    evaluate.add_argument("--only", default="", help="Fixture name, or a comma-separated list.")
+    evaluate.add_argument("--mock", action="store_true", help="Do not call a server. Check that each checker fails on the starter and passes on the solution.")
+    evaluate.add_argument("--base-url")
+    evaluate.add_argument("--max-minutes", type=float, default=40.0)
+    evaluate.add_argument("--retries", type=int, default=0)
+    evaluate.add_argument("--output-dir", type=Path)
+    evaluate.set_defaults(func=_eval)
 
     smoke = sub.add_parser("smoke", help="Run the built-in sample task.")
     smoke.add_argument("--mock", action="store_true", help="Scripted client, no GPU and no server.")
@@ -243,15 +290,33 @@ def _reject_archive_flags(args: argparse.Namespace) -> str | None:
     return None
 
 
+def _test_first_flag(args: argparse.Namespace) -> bool | None:
+    enabled = bool(getattr(args, "test_first", False))
+    disabled = bool(getattr(args, "no_test_first", False))
+    if enabled and disabled:
+        raise RuntimeError("--test-first and --no-test-first cannot be used together.")
+    if enabled:
+        return True
+    if disabled:
+        return False
+    return None
+
+
 def _overnight(args: argparse.Namespace) -> int:
     conflict = _reject_archive_flags(args)
     if conflict:
         print(f"error: {conflict}", file=sys.stderr)
         return 2
+    try:
+        test_first = _test_first_flag(args)
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     profile = get_profile(args.profile)
     task = load_task(args.task)
     log_dir = args.log_dir or (runtime_dir() / "logs" / "overnight")
     result = run_overnight(
+        retries=args.retries,
         task=task,
         project=args.project,
         profile=profile,
@@ -264,6 +329,7 @@ def _overnight(args: argparse.Namespace) -> int:
         init_repo=args.init_repo,
         strict=not args.no_strict,
         context_char_limit=args.context_char_limit,
+        test_first=test_first,
     )
     archived = _archive_overnight_task(args, result.status == "passed")
     print(
@@ -273,14 +339,17 @@ def _overnight(args: argparse.Namespace) -> int:
                 "branch": result.branch,
                 "commit": result.commit,
                 "tests_passed": result.tests_passed,
+                "smoke_passed": result.smoke_passed,
+                "review_passed": result.review_passed,
                 "iterations": result.iterations,
+                "attempts": result.attempts,
                 "report": str(result.report_path) if result.report_path else None,
                 "log_dir": str(result.log_dir),
                 "archived": str(archived) if archived else None,
             }
         )
     )
-    return 0 if result.tests_passed else 1
+    return 0 if result.tests_passed and result.smoke_passed else 1
 
 
 def _archive_overnight_task(args: argparse.Namespace, succeeded: bool) -> Path | None:
@@ -309,6 +378,11 @@ def _queue(args: argparse.Namespace) -> int:
     if conflict:
         print(f"error: {conflict}", file=sys.stderr)
         return 2
+    try:
+        test_first = _test_first_flag(args)
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     profile = get_profile(args.profile)
     log_dir = args.log_dir or (runtime_dir() / "logs" / "queue")
     result = run_queue(
@@ -327,6 +401,8 @@ def _queue(args: argparse.Namespace) -> int:
         archive_dir=args.archive_dir,
         tasks_root=args.tasks_root,
         stop_file=args.stop_file,
+        retries=args.retries,
+        test_first=test_first,
     )
     if result.message:
         print(result.message, file=sys.stderr)
@@ -381,7 +457,12 @@ def _stop(args: argparse.Namespace) -> int:
 
 
 def _validate(args: argparse.Namespace) -> int:
-    from local_agent.taskcheck import collect_task_paths, format_problems, validate_task_files
+    from local_agent.taskcheck import (
+        collect_task_paths,
+        format_problems,
+        validate_task_files,
+        warning_task_files,
+    )
 
     paths = collect_task_paths(args.target)
     project = args.project or (args.target if args.target.is_dir() else args.target.parent)
@@ -389,16 +470,42 @@ def _validate(args: argparse.Namespace) -> int:
         print(f"ok ({len(paths)} file(s), strict checks skipped)")
         return 0
     problems = validate_task_files(paths, project)
+    warnings = warning_task_files(paths, project)
+    for warning in warnings:
+        print(f"warning: {warning}", file=sys.stderr)
     if problems:
         print(format_problems(problems), file=sys.stderr)
         return 1
-    print(f"ok ({len(paths)} file(s))")
+    suffix = f", {len(warnings)} warning(s)" if warnings else ""
+    print(f"ok ({len(paths)} file(s){suffix})")
     return 0
 
 
 def _tune(args: argparse.Namespace) -> int:
-    from local_agent.tune import sweep_profile
+    from local_agent.tune import check_current_offload, sweep_profile
 
+    if args.check:
+        trial = check_current_offload(
+            args.profile,
+            headroom_mib=args.headroom_mib,
+            load_timeout=args.load_timeout,
+        )
+        print(
+            json.dumps(
+                {
+                    "profile": args.profile,
+                    "offload": trial.offload,
+                    "ok": trial.ok,
+                    "failure": trial.failure,
+                    "tokens_per_sec": trial.tokens_per_sec,
+                    "vram_used_mib": trial.vram_used_mib,
+                    "vram_total_mib": trial.vram_total_mib,
+                    "detail": trial.detail,
+                    "headroom_mib": args.headroom_mib,
+                }
+            )
+        )
+        return 0 if trial.ok else 1
     winner = sweep_profile(
         args.profile,
         headroom_mib=args.headroom_mib,
@@ -421,6 +528,23 @@ def _tune(args: argparse.Namespace) -> int:
         )
     )
     return 0
+
+
+def _eval(args: argparse.Namespace) -> int:
+    from local_agent.evalset import run_eval
+
+    only = [part.strip() for part in args.only.split(",") if part.strip()]
+    board = run_eval(
+        profile_name=args.profile,
+        only=only,
+        mock=args.mock,
+        base_url=args.base_url,
+        max_minutes=args.max_minutes,
+        retries=args.retries,
+        output_dir=args.output_dir,
+    )
+    print(json.dumps(board.summary()))
+    return 0 if board.ok else 1
 
 
 def _smoke(args: argparse.Namespace) -> int:

@@ -36,14 +36,32 @@ from local_agent.prompts import (
     plan_prompt,
     review_fix_prompt,
     review_prompt,
+    test_first_prompt,
+    test_first_repair_prompt,
 )
+from local_agent.repo_map import build_repo_map
+from local_agent.smoke_gate import run_smoke
 from local_agent.taskcheck import extract_section, format_problems, review_problems, validate_task
+from local_agent.test_first import (
+    changed_rels,
+    classify_test_run,
+    file_digest,
+    is_test_path,
+    restore_rels,
+    snapshot_tree,
+)
 from local_agent.tools import Workspace, clear_bytecode, run_command
+from local_agent.traceback_files import format_traceback_files
 
 PLAN_FILE = "AGENT_PLAN.md"
 REPORT_FILE = "AGENT_REPORT.md"
 AGENT_DIR_NAME = ".agent"
 _FRONT_MATTER = re.compile(r"\A---\s*\n(.*?)\n---\s*\n", re.DOTALL)
+# 32_000 characters is about a third more than the old 24_000 cap, not the
+# full 1.6x of the 40K -> 64K context change.
+REVIEW_DIFF_CHARS = 32_000
+FIX_DIFF_CHARS = 8_000
+RETRYABLE_STATUSES = {"iteration_budget", "loop_detected", "review_failed"}
 
 
 @dataclass
@@ -55,6 +73,13 @@ class TaskSpec:
     path: Path | None = None
     test_command_explicit: bool = False
     context_paths: list[str] = field(default_factory=list)
+    smoke_command: str | None = None
+    smoke_mode: str = "run"
+    smoke_timeout: int = 120
+    smoke_launch_seconds: float = 6.0
+    smoke_fail_on_traceback: bool = True
+    test_first: bool = False
+    explicit_keys: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -67,6 +92,13 @@ class OvernightResult:
     tests_passed: bool
     log_dir: Path
     review_passed: bool = True
+    smoke_passed: bool = True
+    smoke_ran: bool = False
+    attempts: int = 1
+    attempt_history: list[dict[str, Any]] = field(default_factory=list)
+    stop_requested: bool = False
+    test_output: str = ""
+    review: str = ""
 
 
 def parse_task(text: str, path: Path | None = None) -> TaskSpec:
@@ -76,6 +108,9 @@ def parse_task(text: str, path: Path | None = None) -> TaskSpec:
     test_command = str(meta["test_command"]) if explicit else "python -m pytest -q"
     lint_raw = meta.get("lint_command")
     lint_command = str(lint_raw) if lint_raw else None
+    smoke_mode = (meta.get("smoke_mode") or "run").strip().lower()
+    if smoke_mode not in {"run", "launch"}:
+        smoke_mode = "run"
     return TaskSpec(
         body=body.strip(),
         title=title,
@@ -84,6 +119,15 @@ def parse_task(text: str, path: Path | None = None) -> TaskSpec:
         path=path,
         test_command_explicit=explicit,
         context_paths=context_paths,
+        smoke_command=meta.get("smoke_command") or None,
+        smoke_mode=smoke_mode,
+        smoke_timeout=_meta_int(meta.get("smoke_timeout"), 120),
+        smoke_launch_seconds=_meta_float(meta.get("smoke_launch_seconds"), 6.0),
+        smoke_fail_on_traceback=(
+            _truthy(meta["smoke_fail_on_traceback"]) if "smoke_fail_on_traceback" in meta else True
+        ),
+        test_first=_truthy(meta["test_first"]) if "test_first" in meta else False,
+        explicit_keys=set(meta),
     )
 
 
@@ -133,6 +177,66 @@ def _parse_front_matter(block: str) -> tuple[dict[str, str], list[str]]:
     return meta, context
 
 
+def _truthy(value: str) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _meta_int(value: str | None, default: int) -> int:
+    if not value:
+        return default
+    try:
+        return int(float(value))
+    except ValueError:
+        return default
+
+
+def _meta_float(value: str | None, default: float) -> float:
+    if not value:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
+def agents_front_matter(project: Path) -> dict[str, str]:
+    """Front matter of the target repo's AGENTS.md, or {} when it has none."""
+
+    path = Path(project) / "AGENTS.md"
+    if not path.is_file():
+        return {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    meta, _context, _body = _split_front_matter(text)
+    return meta
+
+
+def apply_project_defaults(task: TaskSpec, project: Path) -> TaskSpec:
+    """Fill smoke and test-first settings the task file left unset.
+
+    A key present on the task, even with an empty value, wins over AGENTS.md.
+    """
+
+    meta = agents_front_matter(project)
+    if "smoke_command" not in task.explicit_keys and meta.get("smoke_command"):
+        task.smoke_command = meta["smoke_command"]
+    if "smoke_mode" not in task.explicit_keys and meta.get("smoke_mode"):
+        mode = meta["smoke_mode"].strip().lower()
+        if mode in {"run", "launch"}:
+            task.smoke_mode = mode
+    if "smoke_timeout" not in task.explicit_keys and meta.get("smoke_timeout"):
+        task.smoke_timeout = _meta_int(meta.get("smoke_timeout"), task.smoke_timeout)
+    if "smoke_launch_seconds" not in task.explicit_keys and meta.get("smoke_launch_seconds"):
+        task.smoke_launch_seconds = _meta_float(meta.get("smoke_launch_seconds"), task.smoke_launch_seconds)
+    if "smoke_fail_on_traceback" not in task.explicit_keys and "smoke_fail_on_traceback" in meta:
+        task.smoke_fail_on_traceback = _truthy(meta["smoke_fail_on_traceback"])
+    if "test_first" not in task.explicit_keys and "test_first" in meta:
+        task.test_first = _truthy(meta["test_first"])
+    return task
+
+
 def _title(body: str) -> str:
     for line in body.splitlines():
         stripped = line.strip()
@@ -162,6 +266,9 @@ def run_overnight(
     init_repo: bool = False,
     strict: bool = True,
     context_char_limit: int = DEFAULT_CONTEXT_CHARS,
+    test_first: bool | None = None,
+    prior_attempt: str = "",
+    branch_attempt: int = 0,
 ) -> OvernightResult:
     project = Path(project).resolve()
     logger = RunLogger(log_dir)
@@ -176,8 +283,16 @@ def run_overnight(
     plan_status = "not_started"
     identity_note = ""
     review_passed = True
+    smoke_passed = True
+    smoke_ran = False
     context_block = ""
+    plan_text = ""
+    review_text = ""
+    use_test_first = False
+    test_first_files = ""
     try:
+        apply_project_defaults(task, project)
+        use_test_first = task.test_first if test_first is None else bool(test_first)
         identity_note = ensure_repository(project, init_repo=init_repo) or ""
         if identity_note:
             logger.event("git_identity", summary=identity_note)
@@ -189,8 +304,21 @@ def run_overnight(
             if problems:
                 raise RuntimeError(format_problems(problems))
         workspace = Workspace(project)
+        context_block = build_project_context(project, task.context_paths, limit=context_char_limit)
+        repo_map = build_repo_map(project)
+        if repo_map.strip():
+            context_block = (context_block.rstrip() + "\n\n" + repo_map).strip() + "\n"
+        if prior_attempt.strip():
+            context_block = (
+                context_block.rstrip()
+                + "\n\nPrevious attempt\n\n"
+                + "An earlier attempt on a fresh branch failed. Tests are still the judge. "
+                + "Do not repeat an approach that already failed these checks.\n\n"
+                + prior_attempt.strip()
+                + "\n"
+            )
         context_block = shrink_context_to_budget(
-            build_project_context(project, task.context_paths, limit=context_char_limit),
+            context_block,
             context_tokens=profile.context,
             generation_tokens=profile.agent_max_tokens_ceiling,
         )
@@ -200,7 +328,7 @@ def run_overnight(
             paths=["AGENTS.md", *task.context_paths],
             summary=f"project context {len(context_block)} chars",
         )
-        branch = _create_branch(project, slugify(task.title))
+        branch = _create_branch(project, slugify(task.title), attempt=branch_attempt)
         logger.event("run_start", branch=branch, profile=profile.name, task=task.title, summary=branch)
 
         plan = _run_phase(
@@ -214,6 +342,11 @@ def run_overnight(
         plan_status = plan.status
         plan_text = plan.content.strip() or "(the model did not return a plan)"
         _write_agent_file(project, PLAN_FILE, _plan_document(task, plan_text))
+
+        if use_test_first and time.monotonic() < deadline:
+            test_first_files = _run_test_first(
+                client, workspace, logger, profile, task, project, context_block, deadline, max_work_turns, test_cmd
+            )
 
         if time.monotonic() >= deadline:
             return _finish(
@@ -240,15 +373,11 @@ def run_overnight(
             if time.monotonic() >= deadline:
                 stop_status = "time_budget"
                 break
-            test_output, tests_passed = _run_checks(project, test_cmd, lint_cmd)
-            logger.event(
-                "tests",
-                iteration=iterations,
-                passed=tests_passed,
-                output=test_output,
-                summary=f"iteration {iterations} passed={tests_passed}",
+            test_output, tests_passed, smoke_passed, ran_smoke = _run_iteration_checks(
+                project, test_cmd, lint_cmd, task, logger, iterations
             )
-            if tests_passed:
+            smoke_ran = smoke_ran or ran_smoke
+            if tests_passed and smoke_passed:
                 stop_status = "passed"
                 break
             if iterations == max_iterations:
@@ -260,7 +389,12 @@ def run_overnight(
             fix = _run_phase(
                 client, workspace, logger, profile,
                 with_project_context(
-                    fix_prompt(task.body, shrink_text(test_output, 12_000), _status_short(project)),
+                    _fix_user_prompt(
+                        task,
+                        project,
+                        test_output,
+                        smoke_failed=tests_passed and not smoke_passed,
+                    ),
                     context_block,
                 ),
                 allowed=None,
@@ -272,15 +406,11 @@ def run_overnight(
                 stop_status = fix.status
                 # Still run the checks once more if the model managed to edit before stopping.
                 if fix.status != "time_budget":
-                    test_output, tests_passed = _run_checks(project, test_cmd, lint_cmd)
-                    logger.event(
-                        "tests",
-                        iteration=iterations,
-                        passed=tests_passed,
-                        output=test_output,
-                        summary=f"after {fix.status} passed={tests_passed}",
+                    test_output, tests_passed, smoke_passed, ran_smoke = _run_iteration_checks(
+                        project, test_cmd, lint_cmd, task, logger, iterations
                     )
-                    if tests_passed:
+                    smoke_ran = smoke_ran or ran_smoke
+                    if tests_passed and smoke_passed:
                         stop_status = "passed"
                 break
         else:
@@ -289,24 +419,29 @@ def run_overnight(
         review_text = ""
         review_passed = False
         if time.monotonic() < deadline:
-            review_text, review_passed, tests_passed, test_output, stop_status = _review_and_maybe_fix(
-                client=client,
-                workspace=workspace,
-                logger=logger,
-                profile=profile,
-                task=task,
-                context_block=context_block,
-                tests_passed=tests_passed,
-                test_output=test_output,
-                stop_status=stop_status,
-                deadline=deadline,
-                max_work_turns=max_work_turns,
-                test_command=test_cmd,
-                lint_command=lint_cmd,
+            review_text, review_passed, tests_passed, smoke_passed, smoke_ran, test_output, stop_status = (
+                _review_and_maybe_fix(
+                    client=client,
+                    workspace=workspace,
+                    logger=logger,
+                    profile=profile,
+                    task=task,
+                    context_block=context_block,
+                    tests_passed=tests_passed,
+                    smoke_passed=smoke_passed,
+                    smoke_ran=smoke_ran,
+                    test_output=test_output,
+                    stop_status=stop_status,
+                    deadline=deadline,
+                    max_work_turns=max_work_turns,
+                    test_command=test_cmd,
+                    lint_command=lint_cmd,
+                    test_first_files=test_first_files,
+                )
             )
-        if tests_passed and review_passed:
+        if tests_passed and smoke_passed and review_passed:
             report_status = "passed"
-        elif not tests_passed:
+        elif not tests_passed or not smoke_passed:
             report_status = stop_status
         else:
             report_status = "review_failed"
@@ -321,6 +456,12 @@ def run_overnight(
             identity_note=identity_note,
             review_passed=review_passed,
             open_questions=_open_questions(plan_text, review_text),
+            smoke_passed=smoke_passed,
+            smoke_ran=smoke_ran,
+            test_output_full=test_output,
+            review_full=review_text,
+            attempt=branch_attempt,
+            prior_attempt=prior_attempt,
         )
     except Exception as exc:
         logger.event("run_error", summary=f"{type(exc).__name__}: {exc}")
@@ -352,23 +493,40 @@ def _review_and_maybe_fix(
     task: TaskSpec,
     context_block: str,
     tests_passed: bool,
+    smoke_passed: bool,
+    smoke_ran: bool,
     test_output: str,
     stop_status: str,
     deadline: float,
     max_work_turns: int,
     test_command: str,
     lint_command: str | None,
-) -> tuple[str, bool, bool, str, str]:
-    """Review once. A not-met criterion or a conflict gets one fix, then a re-review."""
+    test_first_files: str,
+) -> tuple[str, bool, bool, bool, bool, str, str]:
+    """Review once. A not-met criterion or a conflict gets one fix, then a re-review.
+
+    Returns review text, review_passed, tests_passed, smoke_passed, smoke_ran,
+    test output, and stop status.
+    """
 
     review_text, problems = _one_review(
-        client, workspace, logger, profile, task, context_block, tests_passed, deadline, phase="review"
+        client,
+        workspace,
+        logger,
+        profile,
+        task,
+        context_block,
+        tests_passed,
+        deadline,
+        phase="review",
+        test_first_files=test_first_files,
+        smoke_passed=None if not smoke_ran else smoke_passed,
     )
     if not problems:
-        return review_text, True, tests_passed, test_output, stop_status
+        return review_text, True, tests_passed, smoke_passed, smoke_ran, test_output, stop_status
     logger.event("review_rejected", summary="; ".join(problems)[:500], problems=problems)
     if time.monotonic() >= deadline:
-        return review_text, False, tests_passed, test_output, stop_status
+        return review_text, False, tests_passed, smoke_passed, smoke_ran, test_output, stop_status
     _run_phase(
         client, workspace, logger, profile,
         with_project_context(
@@ -380,22 +538,28 @@ def _review_and_maybe_fix(
         deadline=deadline,
         phase="review-fix",
     )
-    test_output, tests_passed = _run_checks(workspace.root, test_command, lint_command)
-    logger.event(
-        "tests",
-        iteration="review-fix",
-        passed=tests_passed,
-        output=test_output,
-        summary=f"after review fix passed={tests_passed}",
+    test_output, tests_passed, smoke_passed, ran_smoke = _run_iteration_checks(
+        workspace.root, test_command, lint_command, task, logger, "review-fix"
     )
-    if not tests_passed:
-        return review_text, False, tests_passed, test_output, "tests_failed"
+    smoke_ran = smoke_ran or ran_smoke
+    if not tests_passed or not smoke_passed:
+        return review_text, False, tests_passed, smoke_passed, smoke_ran, test_output, "tests_failed"
     if time.monotonic() >= deadline:
-        return review_text, False, tests_passed, test_output, stop_status
+        return review_text, False, tests_passed, smoke_passed, smoke_ran, test_output, stop_status
     review_text, problems = _one_review(
-        client, workspace, logger, profile, task, context_block, tests_passed, deadline, phase="review-again"
+        client,
+        workspace,
+        logger,
+        profile,
+        task,
+        context_block,
+        tests_passed,
+        deadline,
+        phase="review-again",
+        test_first_files=test_first_files,
+        smoke_passed=None if not smoke_ran else smoke_passed,
     )
-    return review_text, not problems, tests_passed, test_output, stop_status
+    return review_text, not problems, tests_passed, smoke_passed, smoke_ran, test_output, stop_status
 
 
 def _one_review(
@@ -409,8 +573,10 @@ def _one_review(
     deadline: float,
     *,
     phase: str,
+    test_first_files: str = "",
+    smoke_passed: bool | None = None,
 ) -> tuple[str, list[str]]:
-    diff = fit_review_diff(working_tree_diff(workspace.root), 24_000)
+    diff = fit_review_diff(working_tree_diff(workspace.root), REVIEW_DIFF_CHARS)
     review = _run_phase(
         client, workspace, logger, profile,
         review_prompt(
@@ -420,6 +586,7 @@ def _one_review(
             acceptance=extract_section(task.body, "Acceptance criteria"),
             out_of_scope=extract_section(task.body, "Out of scope"),
             context_block=context_block,
+            test_first_files=test_first_files,
         ),
         allowed=set(),
         max_turns=2,
@@ -427,7 +594,9 @@ def _one_review(
         phase=phase,
     )
     text = review.content.strip()
-    return text, review_problems(text)
+    if smoke_passed is False and "smoke" not in text.lower():
+        text = text + "\n\nSmoke: the smoke command did not pass.\n"
+    return text, review_problems(text, require_test_coverage=bool(test_first_files.strip()))
 
 
 def _run_phase(
@@ -463,6 +632,165 @@ def _run_checks(project: Path, test_command: str, lint_command: str | None) -> t
     return "\n\n".join(parts), ok
 
 
+def _run_iteration_checks(
+    project: Path,
+    test_command: str,
+    lint_command: str | None,
+    task: TaskSpec,
+    logger: RunLogger,
+    iteration: Any,
+) -> tuple[str, bool, bool, bool]:
+    """Run tests, then the smoke command when the tests passed.
+
+    Returns output, tests_passed, smoke_passed, smoke_ran. smoke_passed stays
+    true when the task has no smoke command. A smoke failure does not flip
+    tests_passed; the caller treats either failure as a failed iteration.
+    """
+
+    output, tests_ok = _run_checks(project, test_command, lint_command)
+    logger.event(
+        "tests",
+        iteration=iteration,
+        passed=tests_ok,
+        output=output,
+        summary=f"iteration {iteration} passed={tests_ok}",
+    )
+    if not tests_ok or not task.smoke_command:
+        return output, tests_ok, True, False
+    smoke = run_smoke(
+        task.smoke_command,
+        cwd=project,
+        mode=task.smoke_mode,
+        timeout=task.smoke_timeout,
+        launch_seconds=task.smoke_launch_seconds,
+        fail_on_traceback=task.smoke_fail_on_traceback,
+    )
+    logger.event(
+        "smoke",
+        iteration=iteration,
+        passed=smoke.ok,
+        reason=smoke.reason,
+        output=smoke.output,
+        summary=f"smoke {smoke.reason}",
+    )
+    if smoke.ok:
+        return output + "\n\nSmoke check passed.\n" + smoke.output, True, True, True
+    failed = output + "\n\nSmoke check failed:\n" + smoke.output
+    return failed, True, False, True
+
+
+def _fix_user_prompt(task: TaskSpec, project: Path, test_output: str, *, smoke_failed: bool) -> str:
+    diff = fit_review_diff(working_tree_diff(project), FIX_DIFF_CHARS)
+    cited = format_traceback_files(project, test_output)
+    return fix_prompt(
+        task.body,
+        shrink_text(test_output, 12_000),
+        _status_short(project),
+        smoke_failed=smoke_failed,
+        diff_text=diff,
+        traceback_files=cited,
+    )
+
+
+def _run_test_first(
+    client: ChatClient,
+    workspace: Workspace,
+    logger: RunLogger,
+    profile: Profile,
+    task: TaskSpec,
+    project: Path,
+    context_block: str,
+    deadline: float,
+    max_turns: int,
+    test_command: str,
+) -> str:
+    """Write tests, confirm they fail for a missing implementation, then lock them.
+
+    Returns a short list of locked files for the review prompt, or "" when
+    nothing was locked. An early pass is a warning, not a stop. Tests that
+    still do not collect after one repair are not locked, so the fix loop
+    can repair them.
+    """
+
+    before = snapshot_tree(project)
+    _run_phase(
+        client, workspace, logger, profile,
+        with_project_context(
+            test_first_prompt(task.body, extract_section(task.body, "Acceptance criteria")),
+            context_block,
+        ),
+        allowed={"read", "write", "edit"},
+        max_turns=max_turns,
+        deadline=deadline,
+        phase="test-first",
+    )
+    _revert_non_tests(project, before, logger)
+    test_rels = _new_test_files(project, before)
+    output, passed = _run_checks(project, test_command, None)
+    kind = classify_test_run(output, passed)
+    logger.event("test_first", classification=kind, files=test_rels, summary=kind, output=output)
+    if kind == "broken" and time.monotonic() < deadline:
+        _run_phase(
+            client, workspace, logger, profile,
+            with_project_context(
+                test_first_repair_prompt(task.body, shrink_text(output, 8_000)),
+                context_block,
+            ),
+            allowed={"read", "write", "edit"},
+            max_turns=max_turns,
+            deadline=deadline,
+            phase="test-first-repair",
+        )
+        _revert_non_tests(project, before, logger)
+        test_rels = _new_test_files(project, before)
+        output, passed = _run_checks(project, test_command, None)
+        kind = classify_test_run(output, passed)
+        logger.event(
+            "test_first",
+            classification=kind,
+            files=test_rels,
+            summary=f"after repair {kind}",
+            output=output,
+        )
+    if kind == "passed_early":
+        message = (
+            "warning: test-first tests passed before the implementation. "
+            "Continuing. They are locked so later phases cannot weaken them."
+        )
+        logger.event("test_first_warning", summary=message)
+        print(message, file=sys.stderr)
+    if kind == "broken" or not test_rels:
+        logger.event(
+            "test_first_warning",
+            summary="not locking test files" if kind == "broken" else "no test files changed",
+        )
+        return ""
+    locked = workspace.lock_files(test_rels)
+    logger.event("test_first_lock", paths=locked, summary=f"locked {len(locked)} file(s)")
+    lines = []
+    for rel in locked:
+        digest = file_digest(workspace.locked[rel])
+        lines.append(f"- {rel} sha256={digest[:12]}")
+    return "\n".join(lines)
+
+
+def _revert_non_tests(project: Path, before: dict[str, bytes], logger: RunLogger) -> None:
+    after = snapshot_tree(project)
+    non_tests = [rel for rel in changed_rels(before, after) if not is_test_path(rel)]
+    restored = restore_rels(project, before, non_tests)
+    if restored:
+        logger.event("test_first_restore", paths=restored, summary="reverted non-test edits")
+
+
+def _new_test_files(project: Path, before: dict[str, bytes]) -> list[str]:
+    after = snapshot_tree(project)
+    rels = []
+    for rel in changed_rels(before, after):
+        if is_test_path(rel) and (project / rel).is_file():
+            rels.append(rel)
+    return rels
+
+
 def _finish(
     project: Path,
     logger: RunLogger,
@@ -480,6 +808,12 @@ def _finish(
     identity_note: str = "",
     review_passed: bool = True,
     open_questions: str = "",
+    smoke_passed: bool = True,
+    smoke_ran: bool = False,
+    test_output_full: str = "",
+    review_full: str = "",
+    attempt: int = 0,
+    prior_attempt: str = "",
 ) -> OvernightResult:
     report = _render_report(
         task=task,
@@ -495,11 +829,17 @@ def _finish(
         identity_note=identity_note,
         open_questions=open_questions,
         review_passed=review_passed,
+        smoke_passed=smoke_passed,
+        smoke_ran=smoke_ran,
+        attempt=attempt,
+        prior_attempt=prior_attempt,
     )
     exclude_agent_dir(project)
     report_path = _write_agent_file(project, REPORT_FILE, report)
     commit = _commit(project, task.title, status)
     logger.event("run_end", status=status, commit=commit, summary=f"{status} commit={commit}")
+    stored_output = test_output_full or test_output
+    stored_review = review_full or review
     return OvernightResult(
         status=status,
         branch=branch,
@@ -509,6 +849,11 @@ def _finish(
         tests_passed=tests_passed,
         log_dir=log_dir,
         review_passed=review_passed,
+        smoke_passed=smoke_passed,
+        smoke_ran=smoke_ran,
+        test_output=stored_output,
+        review=stored_review,
+        attempts=attempt or 1,
     )
 
 
@@ -527,21 +872,36 @@ def _render_report(
     identity_note: str = "",
     open_questions: str = "",
     review_passed: bool = True,
+    smoke_passed: bool = True,
+    smoke_ran: bool = False,
+    attempt: int = 0,
+    prior_attempt: str = "",
 ) -> str:
     note = f"\n{identity_note}\n" if identity_note else ""
     questions = open_questions.strip() or "(none recorded)"
+    if not smoke_ran:
+        smoke_line = "- Smoke: not run\n"
+    else:
+        smoke_line = f"- Smoke passed: {'yes' if smoke_passed else 'no'}\n"
+    attempt_line = f"- Attempt: {attempt}\n" if attempt else ""
+    earlier = ""
+    if prior_attempt.strip():
+        earlier = f"## Earlier attempt\n\n{shrink_text(prior_attempt.strip(), 2000)}\n\n"
     return (
         f"# Agent report\n\n"
         f"- Status: {status}\n"
         f"- Tests passed: {'yes' if tests_passed else 'no'}\n"
         f"- Review passed: {'yes' if review_passed else 'no'}\n"
+        f"{smoke_line}"
         f"- Profile: {profile_name}\n"
         f"- Task: {task.title}\n"
         f"- Branch: {branch}\n"
+        f"{attempt_line}"
         f"- Test iterations: {iterations}\n"
         f"- Plan phase: {plan_status}\n"
         f"- Log: {log_dir}\n"
         f"{note}\n"
+        f"{earlier}"
         f"## Review\n\n{review.strip() or '(no review)'}\n\n"
         f"## Open questions\n\n{questions}\n\n"
         f"## Last test output\n\n```\n{shrink_text(test_output or '(tests did not run)', 8000)}\n```\n"
@@ -702,11 +1062,54 @@ def _require_clean_git(project: Path) -> None:
         )
 
 
-def _create_branch(project: Path, slug: str) -> str:
-    stamp = datetime.now().strftime("%Y%m%d-%H%M")
-    name = f"agent/{slug}-{stamp}"
+def _create_branch(project: Path, slug: str, attempt: int = 0) -> str:
+    """Create the working branch.
+
+    A single run keeps the timestamp name. A retry uses ``agent/<slug>-rN``
+    so the second attempt is ``agent/<slug>-r2``. A name that already exists
+    gets a timestamp suffix instead of failing the checkout.
+    """
+
+    if attempt >= 1:
+        name = f"agent/{slug}-r{attempt}"
+    else:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M")
+        name = f"agent/{slug}-{stamp}"
+    if _branch_exists(project, name):
+        name = f"{name}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     _git(project, "checkout", "-b", name)
     return name
+
+
+def _branch_exists(project: Path, name: str) -> bool:
+    result = subprocess.run(
+        ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{name}"],
+        cwd=project,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def _current_branch(project: Path) -> str:
+    name = _git(project, "rev-parse", "--abbrev-ref", "HEAD").strip()
+    if not name or name == "HEAD":
+        raise RuntimeError(f"{project} is in detached HEAD.")
+    return name
+
+
+def _reset_to_branch(project: Path, branch: str) -> None:
+    """Leave a failed attempt and return to the branch it started from.
+
+    The failed commit stays on its agent branch. Uncommitted agent edits are
+    dropped so the next attempt sees the same clean tree the first one did.
+    Ignored files (venv, weights) are not removed.
+    """
+
+    _git(project, "reset", "--hard", check=False)
+    _git(project, "clean", "-fd", "-e", ".agent", check=False)
+    _git(project, "checkout", "-f", branch)
 
 
 def _commit(project: Path, title: str, status: str) -> str | None:
@@ -869,3 +1272,89 @@ def make_client(profile: Profile, base_url: str | None = None) -> ChatClient:
 
 def load_profile(name: str) -> Profile:
     return get_profile(name)
+
+
+def failure_summary(result: OvernightResult) -> str:
+    """Short note injected into the next attempt. Tests stay the judge."""
+
+    parts = [
+        f"Status: {result.status}",
+        f"Branch: {result.branch}",
+        f"Tests passed: {'yes' if result.tests_passed else 'no'}",
+        f"Smoke passed: {'yes' if result.smoke_passed else 'no'}",
+        f"Review passed: {'yes' if result.review_passed else 'no'}",
+        f"Iterations: {result.iterations}",
+    ]
+    questions = extract_section(result.review or "", "Open questions")
+    if questions.strip():
+        parts.append("Open questions:\n" + questions.strip())
+    if (result.review or "").strip():
+        parts.append("Review:\n" + shrink_text(result.review, 1500))
+    if (result.test_output or "").strip():
+        parts.append("Failing checks:\n" + shrink_text(result.test_output, 2000))
+    return shrink_text("\n\n".join(parts), 4000)
+
+
+def _passed(result: OvernightResult) -> bool:
+    return bool(result.tests_passed and result.review_passed and result.smoke_passed)
+
+
+def run_with_retries(
+    *,
+    retries: int = 0,
+    stop_file: Path | None = None,
+    **kwargs: Any,
+) -> OvernightResult:
+    """Run a task, and on a retryable failure start again from the original branch.
+
+    `retries` is the number of extra attempts. Zero keeps today's single run,
+    including leaving the worktree on the agent branch. A stop file is checked
+    only between attempts.
+    """
+
+    from local_agent.control import stop_is_requested
+
+    retries = max(0, int(retries))
+    project = Path(kwargs["project"]).resolve()
+    kwargs["project"] = project
+    base = _current_branch(project)
+    prior = ""
+    history: list[dict[str, Any]] = []
+    last: OvernightResult | None = None
+    for attempt in range(1, retries + 2):
+        if attempt > 1 and stop_file is not None and stop_is_requested(Path(stop_file)):
+            if last is not None:
+                last.stop_requested = True
+                last.attempts = attempt - 1
+                last.attempt_history = history
+            break
+        if attempt > 1:
+            _reset_to_branch(project, base)
+        call = dict(kwargs)
+        call["prior_attempt"] = prior
+        call["branch_attempt"] = attempt if retries else 0
+        if retries:
+            call["log_dir"] = Path(kwargs["log_dir"]) / f"attempt-{attempt}"
+        last = run_overnight(**call)
+        history.append(
+            {
+                "attempt": attempt,
+                "status": last.status,
+                "branch": last.branch,
+                "commit": last.commit,
+                "tests_passed": last.tests_passed,
+                "review_passed": last.review_passed,
+                "smoke_passed": last.smoke_passed,
+            }
+        )
+        last.attempts = attempt
+        last.attempt_history = list(history)
+        if _passed(last):
+            return last
+        if last.status not in RETRYABLE_STATUSES or attempt == retries + 1:
+            break
+        prior = failure_summary(last)
+    assert last is not None
+    if retries and not _passed(last):
+        _reset_to_branch(project, base)
+    return last

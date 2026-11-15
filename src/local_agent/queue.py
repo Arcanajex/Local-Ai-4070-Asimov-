@@ -46,7 +46,7 @@ from local_agent.overnight import (
     _git,
     ensure_repository,
     load_task,
-    run_overnight,
+    run_with_retries,
 )
 
 STATE_NAME = "queue-state.json"
@@ -257,26 +257,51 @@ def render_summary(
     lines.extend(
         [
             "",
-            "| Task | Status | Branch | Commit | Iterations | Duration |",
-            "| --- | --- | --- | --- | --- | --- |",
+            "| Task | Status | Branch | Commit | Iterations | Attempts | Duration |",
+            "| --- | --- | --- | --- | --- | --- | --- |",
         ]
     )
     ordered = sorted(tasks, key=lambda record: natural_key(str(record.get("name", ""))))
     if not ordered:
-        lines.append("| (none) |  |  |  |  |  |")
+        lines.append("| (none) |  |  |  |  |  |  |")
     for record in ordered:
         lines.append(
-            "| {name} | {status} | {branch} | {commit} | {iterations} | {duration} |".format(
+            "| {name} | {status} | {branch} | {commit} | {iterations} | {attempts} | {duration} |".format(
                 name=record.get("name", ""),
                 status=record.get("status", ""),
                 branch=record.get("branch") or "",
                 commit=record.get("commit") or "",
                 iterations=record.get("iterations", ""),
+                attempts=record.get("attempts", ""),
                 duration=_format_duration(record.get("duration_seconds")),
             )
         )
+    attempt_lines = _attempt_lines(ordered)
+    if attempt_lines:
+        lines.extend(["", "## Attempts", ""])
+        lines.extend(attempt_lines)
     lines.append("")
     return "\n".join(lines)
+
+
+def _attempt_lines(tasks: list[dict[str, Any]]) -> list[str]:
+    lines: list[str] = []
+    for record in tasks:
+        history = record.get("attempt_history") or []
+        if not history:
+            continue
+        lines.append(f"### {record.get('name', '')}")
+        for item in history:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                "- attempt {attempt}: {status} branch {branch}".format(
+                    attempt=item.get("attempt", ""),
+                    status=item.get("status", ""),
+                    branch=item.get("branch") or "",
+                )
+            )
+    return lines
 
 
 def _disposition_lines(tasks: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
@@ -324,6 +349,8 @@ def run_queue(
     tasks_root: Path | None = None,
     stop_file: Path | None = None,
     run_task: RunTask | None = None,
+    retries: int = 1,
+    test_first: bool | None = None,
 ) -> QueueResult:
     task_dir = Path(task_dir).resolve()
     project = Path(project).resolve()
@@ -363,6 +390,10 @@ def run_queue(
         problems = validate_task_files(discovered, project)
         if problems:
             raise RuntimeError(format_problems(problems))
+        from local_agent.taskcheck import warning_task_files
+
+        for warning in warning_task_files(discovered, project):
+            print(f"warning: {warning}", file=sys.stderr)
     pending, skipped_names = pending_tasks(task_dir, state, archive_dir=scan_archive)
     if not pending and not state["tasks"]:
         raise RuntimeError(
@@ -434,6 +465,9 @@ def run_queue(
                 max_iterations=max_iterations,
                 init_repo=False,
                 strict=strict,
+                retries=retries,
+                stop_file=stop_path,
+                test_first=test_first,
             )
         except Exception as exc:
             duration = time.perf_counter() - started
@@ -461,7 +495,30 @@ def run_queue(
             continue
 
         duration = time.perf_counter() - started
-        if result.tests_passed and result.review_passed:
+        if getattr(result, "stop_requested", False):
+            stored, disposition = _store_failure(path, task_dir, archive=archive)
+            _record(
+                state,
+                key,
+                status=result.status or "failed",
+                branch=result.branch,
+                commit=result.commit,
+                merge_commit=None,
+                iterations=result.iterations,
+                duration=duration,
+                detail="stopped between attempts",
+                stored_at=stored,
+                disposition=disposition,
+                attempts=getattr(result, "attempts", 1),
+                attempt_history=getattr(result, "attempt_history", None),
+            )
+            stopped_on_request = True
+            request_pending = [key] + [task_key(item, task_dir) for item in pending[index + 1 :]]
+            clear_stop_file(stop_path)
+            persist(in_progress=True)
+            _return_to_base(project, base_branch)
+            break
+        if result.tests_passed and result.review_passed and getattr(result, "smoke_passed", True):
             try:
                 merge_commit = merge_no_ff(project, base_branch, result.branch) if result.branch else ""
             except Exception as exc:
@@ -503,6 +560,8 @@ def run_queue(
                 detail=detail,
                 stored_at=stored,
                 disposition=disposition,
+                attempts=getattr(result, "attempts", 1),
+                attempt_history=getattr(result, "attempt_history", None),
             )
             persist(in_progress=True)
             continue
@@ -520,6 +579,8 @@ def run_queue(
             detail="tests did not pass" if not result.tests_passed else "review rejected the change",
             stored_at=stored,
             disposition=disposition,
+            attempts=getattr(result, "attempts", 1),
+            attempt_history=getattr(result, "attempt_history", None),
         )
         if not continue_on_failure:
             stopped_on = key
@@ -597,7 +658,9 @@ def run_queue(
 
 
 def _default_run_task(**kwargs: Any) -> OvernightResult:
-    return run_overnight(**kwargs)
+    retries = int(kwargs.pop("retries", 0))
+    stop_file = kwargs.pop("stop_file", None)
+    return run_with_retries(retries=retries, stop_file=stop_file, **kwargs)
 
 
 def _overall_status(state: dict[str, Any], stopped_early: bool, stopped_on_request: bool) -> str:
@@ -624,19 +687,25 @@ def _record(
     detail: str,
     stored_at: str,
     disposition: str,
+    attempts: int = 1,
+    attempt_history: list[dict[str, Any]] | None = None,
 ) -> None:
-    state["tasks"][name] = {
+    record: dict[str, Any] = {
         "name": name,
         "status": status,
         "branch": branch,
         "commit": commit,
         "merge_commit": merge_commit,
         "iterations": iterations,
+        "attempts": attempts,
         "duration_seconds": round(duration, 3),
         "detail": detail,
         "stored_at": stored_at,
         "disposition": disposition,
     }
+    if attempt_history:
+        record["attempt_history"] = attempt_history
+    state["tasks"][name] = record
 
 
 def _store_success(

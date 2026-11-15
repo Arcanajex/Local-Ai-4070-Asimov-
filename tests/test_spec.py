@@ -37,7 +37,7 @@ def test_default_context_cap_fits_the_quality_retry_budget():
     profile = get_profile("quality")
     block = "Project context\n" + ("x" * (DEFAULT_CONTEXT_CHARS - 20))
     assert len(block) <= DEFAULT_CONTEXT_CHARS
-    assert profile.context == 40960
+    assert profile.context == 65536
     assert profile.agent_max_tokens == 16384
     assert profile.agent_max_tokens_ceiling == 24576
     assert context_fits_budget(

@@ -20,13 +20,19 @@ def test_quality_profile_matches_checked_gguf():
     assert profile.repo == "unsloth/Qwen3.6-35B-A3B-GGUF"
     assert profile.size_bytes == 22134528992
     assert profile.moe is True
-    assert profile.context == 40960
+    assert profile.context == 65536
     assert profile.n_cpu_moe == 34
     assert profile.n_predict == -1
     assert profile.agent_max_tokens >= 8192
     assert profile.agent_max_tokens_ceiling >= profile.agent_max_tokens
     assert profile.reasoning == "on"
-    assert 32768 <= profile.context <= 40960
+    assert profile.reasoning_budget == 10240
+    assert profile.preserve_thinking is True
+    assert profile.reasoning_replay_turns == 2
+    assert profile.temperature == 0.6
+    assert profile.top_p == 0.95
+    assert profile.top_k == 20
+    assert profile.repeat_penalty == 1.0
 
 
 def test_day_profile_matches_the_8gb_bench():
@@ -40,6 +46,8 @@ def test_day_profile_matches_the_8gb_bench():
     assert profile.agent_max_tokens == 8192
     assert profile.reasoning_effort == "medium"
     assert profile.jinja is True
+    assert profile.preserve_thinking is False
+    assert profile.reasoning_replay_turns == 0
 
 
 def test_max_profile_is_optional_dense_offload():
@@ -59,7 +67,7 @@ def test_server_args_pin_the_laptop_safe_flags():
     args = build_server_args(quality, model_file=Path("Qwen.gguf"))
     assert _flag(args, "--model") == "Qwen.gguf"
     assert _flag(args, "--host") == "127.0.0.1"
-    assert _flag(args, "--ctx-size") == "40960"
+    assert _flag(args, "--ctx-size") == "65536"
     assert _flag(args, "--n-predict") == "-1"
     assert _flag(args, "--n-gpu-layers") == "all"
     assert _flag(args, "--parallel") == "1"
@@ -68,20 +76,23 @@ def test_server_args_pin_the_laptop_safe_flags():
     assert _flag(args, "--cache-type-k") == "q8_0"
     assert _flag(args, "--n-cpu-moe") == "34"
     assert _flag(args, "--reasoning") == "on"
-    assert _flag(args, "--reasoning-budget") == "-1"
+    assert _flag(args, "--reasoning-budget") == "10240"
     assert "--jinja" in args
     assert "--n-cpu-ffn" not in args
+    assert _flag(args, "--chat-template-kwargs") == '{"preserve_thinking":true}'
 
     day = build_server_args(get_profile("day"), model_file=Path("gpt.gguf"))
     assert _flag(day, "--n-cpu-moe") == "30"
     assert _flag(day, "--ctx-size") == "32768"
     assert _flag(day, "--reasoning-effort") == "medium"
     assert "--reasoning-budget" not in day
+    assert "--chat-template-kwargs" not in day
 
     dense = build_server_args(get_profile("max"), model_file=Path("dense.gguf"))
     assert _flag(dense, "--n-cpu-ffn") == "64"
     assert "--n-cpu-moe" not in dense
     assert _flag(dense, "--reasoning-effort") == "high"
+    assert _flag(dense, "--chat-template-kwargs") == '{"preserve_thinking":true}'
 
 
 def test_overrides_replace_offload_and_reject_typos(tmp_path):

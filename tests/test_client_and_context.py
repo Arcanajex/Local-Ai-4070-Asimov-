@@ -16,7 +16,7 @@ from local_agent.client import (
     result_from_response,
 )
 from local_agent.config import get_profile
-from local_agent.context import compact_messages, estimate_tokens, prompt_budget
+from local_agent.context import PROMPT_BUDGET_CAP, compact_messages, estimate_tokens, prompt_budget
 from local_agent.loop_detect import LoopDetector
 
 
@@ -47,6 +47,9 @@ def test_openai_tool_call_and_reasoning_are_split():
     assert result.tool_calls[0].arguments == {"path": "adder.py"}
     history = assistant_message(result)
     assert "reasoning" not in history
+    assert "reasoning_content" not in history
+    replayed = assistant_message(result, include_reasoning=True)
+    assert replayed["reasoning_content"] == "I should read the file."
     assert history["tool_calls"][0]["function"]["arguments"] == {"path": "adder.py"}
 
 
@@ -143,3 +146,39 @@ def test_loop_detector_warns_then_stops_and_catches_oscillation():
     assert other.observe([b], "") == "ok"
     assert other.observe([a], "") == "ok"
     assert other.observe([b], "") == "stop"
+
+
+def test_prompt_budget_grows_with_context_but_stays_capped():
+    # The old 40K window left about 24K for the prompt at a 16K completion.
+    assert prompt_budget(40960, 16384) == 40960 - 16384 - 256
+    # 64K would otherwise allow ~49K. The cap keeps the prompt conservative.
+    assert prompt_budget(65536, 16384) == PROMPT_BUDGET_CAP
+    assert prompt_budget(65536, 24576) == PROMPT_BUDGET_CAP
+    assert prompt_budget(32768, 8192) < PROMPT_BUDGET_CAP
+
+
+def test_compaction_drops_old_reasoning_before_tool_output():
+    messages = [
+        {"role": "system", "content": "rules"},
+        {"role": "user", "content": "TASK keep me"},
+    ]
+    for index in range(4):
+        messages.append(
+            {
+                "role": "assistant",
+                "content": f"step {index}",
+                "reasoning_content": f"OLDTHINK{index}" + (" think" * 400),
+            }
+        )
+        messages.append({"role": "tool", "content": f"RESULT{index}" + (" x" * 20)})
+    compacted = compact_messages(messages, budget_tokens=5000, reasoning_keep=2)
+    joined = "\n".join(str(message.get("reasoning_content") or "") for message in compacted)
+    assert "OLDTHINK0" not in joined
+    assert "OLDTHINK1" not in joined
+    assert "TASK keep me" in "\n".join(str(message.get("content") or "") for message in compacted)
+    kept = [message for message in compacted if message.get("reasoning_content")]
+    assert len(kept) <= 2
+    # A budget that cannot hold the remaining traces drops those too, before the task.
+    tight = compact_messages(messages, budget_tokens=200, reasoning_keep=2)
+    assert all(not message.get("reasoning_content") for message in tight)
+    assert any("TASK keep me" in str(message.get("content") or "") for message in tight)

@@ -39,6 +39,17 @@
 .PARAMETER MaxHoursPerTask
   Wall-clock budget for each task. Default 8.
 
+.PARAMETER Retries
+  Extra attempts for a task that stops on the iteration budget, a detected
+  loop, or a failed review. Default 1. Each attempt starts from the original
+  base branch. A stop request is honored between attempts. Use 0 to disable.
+
+.PARAMETER TestFirst
+  Force a test-first phase on every task.
+
+.PARAMETER NoTestFirst
+  Skip the test-first phase even when a task sets test_first.
+
 .PARAMETER ArchiveDir
   Folder passing task files are moved into. Default is tasks\archive in
   this repo. The path under the tasks root is kept.
@@ -61,6 +72,9 @@ param(
     [string]$TasksRoot = '',
     [double]$MaxHoursPerTask = 8,
     [int]$MaxIterations = 6,
+    [int]$Retries = 1,
+    [switch]$TestFirst,
+    [switch]$NoTestFirst,
     [int]$Port = 8080,
     [switch]$InitRepo,
     [switch]$ContinueOnFailure,
@@ -139,6 +153,9 @@ function Show-QueueNotification {
 Assert-NativeWindows
 if ($NoArchive -and $ArchiveDir) {
     throw '-NoArchive and -ArchiveDir cannot be used together.'
+}
+if ($TestFirst -and $NoTestFirst) {
+    throw '-TestFirst and -NoTestFirst cannot be used together.'
 }
 $InstallDir = Get-InstallDir $InstallDir
 $python = Get-VenvPython $InstallDir
@@ -223,11 +240,14 @@ try {
         '--base-url', $base,
         '--max-hours-per-task', "$MaxHoursPerTask",
         '--max-iterations', "$MaxIterations",
+        '--retries', "$Retries",
         '--log-dir', (Join-Path $logDir ('queue-run-{0}' -f (Get-Date -Format 'yyyyMMdd-HHmmss')))
     )
     if ($InitRepo) { $agentArgs += '--init-repo' }
     if ($ContinueOnFailure) { $agentArgs += '--continue-on-failure' }
     if ($NoStrict) { $agentArgs += '--no-strict' }
+    if ($TestFirst) { $agentArgs += '--test-first' }
+    if ($NoTestFirst) { $agentArgs += '--no-test-first' }
     if ($AllowMain) { $agentArgs += '--allow-main' }
     if ($NoArchive) { $agentArgs += '--no-archive' }
     if ($ArchiveDir) { $agentArgs += @('--archive-dir', $ArchiveDir) }

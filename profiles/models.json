@@ -45,12 +45,14 @@
       "block_count": 40,
       "total_params_b": 35,
       "active_params_b": 3,
-      "context": 40960,
+      "context": 65536,
       "n_predict": -1,
       "n_cpu_moe": 34,
       "tune_candidates": [40, 36, 34, 32, 30],
       "reasoning": "on",
-      "reasoning_budget": -1,
+      "reasoning_budget": 10240,
+      "preserve_thinking": true,
+      "reasoning_replay_turns": 2,
       "temperature": 0.6,
       "top_p": 0.95,
       "top_k": 20,
@@ -61,11 +63,11 @@
       "request_timeout_seconds": 3600,
       "expected": {
         "file_gb_decimal": 22.13,
-        "vram": "Roughly 5 to 7.5 GiB at 40K context with n-cpu-moe 34. A published 12 GB / 16 GB sizing note for this same Unsloth UD-Q4_K_M file puts expert tensors near 0.45 GiB per layer across 40 layers, with about 1.9 GiB of non-expert weights on GPU after the embedding stays on CPU, and about 0.8 GiB of FP16 KV at 40K because only 10 layers are full attention. The witcheer 8GB bench (RTX 4060 Ti, May 2026) used n-cpu-moe 30 and recorded 7.2 GB, which is tight once Windows is using the laptop GPU.",
+        "vram": "Roughly 5 to 7.5 GiB at 40K context with n-cpu-moe 34, and a bit more at 64K. A published 12 GB / 16 GB sizing note for this same Unsloth UD-Q4_K_M file puts expert tensors near 0.45 GiB per layer across 40 layers, with about 1.9 GiB of non-expert weights on GPU after the embedding stays on CPU, and about 0.8 GiB of FP16 KV at 40K because only 10 layers are full attention. q8_0 KV is smaller than that FP16 figure; 64K is about 1.6x the 40K cache. The witcheer 8GB bench (RTX 4060 Ti, May 2026) used n-cpu-moe 30 and recorded 7.2 GB, which is tight once Windows is using the laptop GPU. Re-run the tuner after this context change and keep dedicated VRAM about 1 GB under the 8 GB total.",
         "ram": "The 20.6 GiB file is mmap'd. With most experts on CPU, plan on about 22 GiB resident plus the OS. 32 GB is enough if other large apps are closed and a page file exists. Do not pass --mlock.",
         "speed": "The same bench reported about 35 tok/s decode at n-cpu-moe 30 on a desktop 4060 Ti, and thinking mode made wall-clock time much worse because the model spends tokens on reasoning. A Legion 4070 with n-cpu-moe 34 should land in a similar band, not in the hundreds of tok/s. This was not measured on a 4070 laptop."
       },
-      "notes": "Shipped n-cpu-moe is 34, not the bench's 30, so a laptop display and CUDA context have room under 8 GB. Run scripts/tune-n-cpu-moe.ps1 -Profile quality once; it writes runtime/overrides.json. --fit is off so llama.cpp cannot silently shrink the 40K context. --n-predict -1 lets the request max_tokens be the cap; a small server-side -n is what makes thinking models return an empty content field. Repeat penalty stays at 1. Batch 512 keeps the CUDA compute buffer smaller than the 2048 the official gpt-oss guide uses on roomier cards."
+      "notes": "Shipped n-cpu-moe is 34, not the bench's 30, so a laptop display and CUDA context have room under 8 GB. Context is 65536. Run scripts/tune-n-cpu-moe.ps1 -Profile quality again after pulling this change; it writes runtime/overrides.json. A one-shot fit check that does not change the offload is scripts/tune-n-cpu-moe.ps1 -Profile quality -Check. Confirm nvidia-smi memory.used stays about 1 GB under the dedicated total. --fit is off so llama.cpp cannot silently shrink the context. --reasoning-budget 10240 caps the thinking trace so it cannot consume the whole 16384 max_tokens and return an empty content field (llama.cpp b12110: -1 unrestricted, 0 immediate end, N>0 token budget). --n-predict -1 lets the request max_tokens be the cap. preserve_thinking plus reasoning_replay_turns 2 send the last two reasoning_content values back; compaction drops older reasoning first. Repeat penalty stays at 1. Batch 512 keeps the CUDA compute buffer smaller than the 2048 the official gpt-oss guide uses on roomier cards. Sampling (temperature 0.6, top-p 0.95, top-k 20, repeat penalty 1.0) is Qwen's published coding recipe and is unchanged."
     },
     "day": {
       "role": "fast",
@@ -87,6 +89,8 @@
       "tune_candidates": [30, 24, 20, 16],
       "reasoning": "on",
       "reasoning_effort": "medium",
+      "preserve_thinking": false,
+      "reasoning_replay_turns": 0,
       "temperature": 1.0,
       "top_p": 1.0,
       "top_k": 0,
@@ -124,6 +128,8 @@
       "reasoning": "on",
       "reasoning_budget": -1,
       "reasoning_effort": "high",
+      "preserve_thinking": true,
+      "reasoning_replay_turns": 2,
       "temperature": 0.6,
       "top_p": 0.95,
       "top_k": 20,

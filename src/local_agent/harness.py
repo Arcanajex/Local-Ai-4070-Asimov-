@@ -106,7 +106,12 @@ class AgentHarness:
             if verdict == "warn":
                 self.logger.event("loop_warning", summary="repeated action, one more chance")
 
-            messages.append(assistant_message(result))
+            messages.append(
+                assistant_message(
+                    result,
+                    include_reasoning=self.profile.reasoning_replay_turns > 0,
+                )
+            )
             for call in result.tool_calls:
                 if self.allowed_tools is not None and call.name not in self.allowed_tools:
                     output = f"tool {call.name} is not available in this phase"
@@ -115,6 +120,14 @@ class AgentHarness:
                     tool_result = dispatch(call.name, call.arguments, self.workspace)
                     output = tool_result.output
                     ok = tool_result.ok
+                restored = self.workspace.restore_locked()
+                if restored:
+                    output += (
+                        "\nwarning: restored locked test-first file(s): "
+                        + ", ".join(restored)
+                        + ". Do not modify those tests."
+                    )
+                    ok = False
                 self.logger.event(
                     "tool_result",
                     name=call.name,
@@ -189,7 +202,11 @@ class AgentHarness:
 
     def _fit(self, messages: list[dict[str, Any]], max_tokens: int) -> list[dict[str, Any]]:
         budget = prompt_budget(self.profile.context, max_tokens)
-        compacted = compact_messages(messages, budget)
+        compacted = compact_messages(
+            messages,
+            budget,
+            reasoning_keep=self.profile.reasoning_replay_turns,
+        )
         if len(compacted) != len(messages):
             self.logger.event(
                 "compact",
