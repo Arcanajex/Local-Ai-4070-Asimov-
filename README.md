@@ -58,6 +58,7 @@ This pass is about a run you can leave overnight. Sampling (temperature, top-p, 
 - `test_first: true` / `--test-first` / `-TestFirst` writes tests first and locks them. Default off: a bad locked test cannot be repaired in the fix loop.
 - The queue retries once (`-Retries 1`, `--retries 1`) from a fresh `agent/<slug>-r2` branch when the iteration budget, a loop, or the review fails. A single overnight run does not retry unless you pass `-Retries`. The stop file is checked between attempts. Archive only happens when an attempt passes.
 - `python -m local_agent eval --mock` checks the fixture checkers with no server. `--profile quality` runs them against the live server.
+- Failed runs that only explored, leaked `<tool_call>` into the review, or let review-fix destroy a passing tree are covered in [Guards from failed runs](#guards-from-failed-runs). Defaults are unchanged for an existing task file: plan 8 turns, implement 30, exploration cap 10, no bonus turns.
 
 On the laptop, after you pull, before the long queue:
 
@@ -289,7 +290,7 @@ What it does:
 6. **Plan.** The model may read files. Its plan is saved as `AGENT_PLAN.md`.
 7. **Implement.** Read, write, edit, and shell, up to 30 turns.
 8. **Test.** The runner executes the task's `test_command` (default `python -m pytest -q`). On failure it starts a fresh conversation with the failure output and `git status`, and the model edits again. That repeat stops when tests pass, when `-MaxIterations` is hit (default 6), or when `-MaxHours` is hit (default 8). A fresh conversation per failure is deliberate: continuing one transcript is how the bench hit the context limit in the middle of a debug loop.
-9. **Review.** One call, no tools, with the full change set. New files are included. `git diff` by itself hides them until they are staged, which is what produced an empty review on a repo whose only commit was empty. The model answers Correctness / Tests / Risks / Verdict.
+9. **Review.** One call, no tools, with the full change set. New files are included. `git diff` by itself hides them until they are staged, which is what produced an empty review on a repo whose only commit was empty. The model answers Correctness / Tests / Risks / Verdict. A reply that leaks `<tool_call>` markup or omits a required section is re-prompted twice and is not sent to review-fix.
 10. Writes `AGENT_REPORT.md` and commits it with the code. The committer name stays yours when `git config user.name` and `user.email` are set. If either is missing, the run still commits, prints a message that says so, and uses a one-shot `Local Coding Agent <local-agent@localhost>` for that commit only. Your git config is not changed.
 
 The task file can set the commands in front matter:
@@ -306,6 +307,22 @@ What should change, and how to tell it works.
 ```
 
 `lint_command` runs only after the tests pass. The shell is PowerShell, so a command you write here has to be something PowerShell can run. The sample task is `tasks\smoke-task.md`.
+
+Optional front matter, all unset by default except the turn budgets and the exploration cap:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `must_exist` | unset | Paths that must exist, or names that must show up in the test output, or the test gate fails. |
+| `plan_turns` | 8 | Plan-phase turn budget. Also a profile / `overrides.json` key. |
+| `implement_turns` | 30 | Implement, fix, and review-fix turn budget. Same precedence. |
+| `exploration_cap` | 10 | Read-only calls in a row before a "write the files now" nudge. `0` turns it off. |
+| `exploration_bonus_turns` | 0 | One extra budget when the phase ran out of turns while exploring. |
+| `cheat_sheet_marker` | `cheat sheet` | Heading substring copied verbatim into the implement, fix, and review-fix system prompt. |
+| `api_error_patterns` | `CS1503`, `CS0214`, `CS1061`, `CS0117` | Substrings that re-inject the cheat sheet after a compile error. |
+| `blocked_probes` | ilspycmd, `dotnet new`, reflection loads, and similar | Extra shell patterns that are refused. |
+| `scratch_dirs` | `diag`, `apicheck`, `api-check`, `_probe`, `scratch`, `throwaway` | Directories that cannot be created unless the plan names them. |
+
+The same numeric keys can sit on the profile in `profiles\models.json` or under that profile in `runtime\overrides.json`. A value in the task file wins over the profile. Passing an explicit turn budget to the Python function (the tests and the eval runner do this) wins over the task file. See [docs/TASK_TEMPLATE.md](docs/TASK_TEMPLATE.md).
 
 Shell commands the model issues are killed at 120 seconds unless it passes a lower `timeout_seconds`. The hard cap is 600 seconds. `git push`, `git reset --hard`, `git clean`, `shutdown`, `diskpart`, and `rm -rf /` are refused. That list is a tripwire for an unattended run, not a sandbox: the model can run anything you can run.
 
@@ -326,7 +343,20 @@ python -m local_agent validate C:\src\my-app\tasks --project C:\src\my-app
 
 The queue checks every task file before the first one starts, including markdown in task-list subfolders, and refuses with the full list of problems. `-NoStrict` (`--no-strict`) runs older files, including `tasks/ui/*`, that predate the template. Files under `tasks\archive` are not checked and are not run.
 
-The self-review must answer `Acceptance criteria` (each line `met` or `not met`), `Out-of-scope files touched`, and `Conflicts with AGENTS.md or decisions`. A `not met` line or a conflict runs one fix iteration and a second review. The diff in that prompt starts with the file list. If the patch does not fit, the prompt names the files that were left out.
+The self-review must answer `Acceptance criteria` (each line `met` or `not met`), `Out-of-scope files touched`, and `Conflicts with AGENTS.md or decisions`. A `not met` line or a conflict runs one fix iteration and a second review. The review-fix prompt tells the model to change only those findings and not to rewrite files that already work. If that fix turns a passing test run into a failing one, the runner restores the last passing snapshot and records `review_fix_reverted`. A review that is tool-call markup, or that is still missing a required section after two re-prompts, is `review_malformed`. It is not forwarded to review-fix. The diff in the review prompt starts with the file list. If the patch does not fit, the prompt names the files that were left out.
+
+## Guards from failed runs
+
+These are on for every task. They do not change a task file that already passes.
+
+- **Exploration cap.** After 10 read-only or probing calls in a row with no file write (`exploration_cap`), the harness adds `Stop exploring. Write the files now and build early.` If the model keeps going, further reads are refused and the phase can stop as `exploration_capped`. Shell commands that decompile or reflect (`ilspycmd`, `ildasm`, `javap`, `Assembly.Load`, and the other built-in patterns), scaffold a new project (`dotnet new`, `npm init`, `cargo new`, `go mod init`), or create a scratch directory outside the plan (`diag`, `apicheck`, …) are refused immediately. A new `.csproj`, `.fsproj`, `.vbproj`, or `.sln` is refused unless the plan names that path. Editing a project file that already exists is allowed.
+- **Cheat sheet.** A heading in `AGENTS.md` or a `context:` file whose text contains `cheat sheet` (or `cheat_sheet_marker`) is copied verbatim into the system prompt for implement, fix, and review-fix. It is not taken from the truncated Project context block. When test output contains `CS1503`, `CS0214`, `CS1061`, or `CS0117` (or `api_error_patterns`), the fix prompt repeats the sheet.
+- **False pass.** If implement stops on the turn budget or the exploration cap, or the diff is empty, or it does not substantively touch a file the plan said it would add or edit, a passing test command is not success. The runner starts a fix round with that reason. `must_exist` is checked in the same test gate. A one-line edit of a file the plan named is enough; that is not a near-empty diff.
+- **Snapshots.** Every passing test iteration is stored as a commit on `refs/asimov/snapshots/<branch-with-slashes-replaced>/<n>` without moving HEAD, and the ref is written to `events.jsonl`. The refs are kept. If the run ends with failing checks and a snapshot exists, that snapshot is restored before the final commit. `git show <ref>` still works afterwards.
+- **Plain text.** Plan, review, and the second review strip leaked `<tool_call>` markup. Review is re-prompted up to twice and must be written from the diff already in the prompt.
+- **BOM.** `load_task` reads task files as UTF-8 with the BOM stripped. `validate` says when front matter cannot be parsed.
+
+`exploration_bonus_turns` defaults to 0, so a phase that spends its budget exploring does not silently get more turns. Set it on the task or the profile when you want one bonus budget for that case.
 
 `AGENT_PLAN.md` and `AGENT_REPORT.md` are written to `<project>\.agent\`. The runner adds `.agent/` to `.git\info\exclude`, which is local to the clone and is not `.gitignore`, so `git add -A` does not commit them. The report includes an `Open questions` section. The result JSON still has the report path.
 

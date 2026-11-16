@@ -15,6 +15,12 @@ smoke_launch_seconds: 6
 context:
   - src/app.py
   - docs/decisions.md
+must_exist:
+  - src/app.py
+  - test_widget
+plan_turns: 8
+implement_turns: 30
+exploration_cap: 10
 ---
 
 # Short title
@@ -66,6 +72,19 @@ contradicts `AGENTS.md` or this file fails the self-review.
 | `smoke_fail_on_traceback` | No | Default true. Set `false` to ignore a traceback in the output. |
 | `test_first` | No | `true` writes tests from the acceptance criteria before implementation and locks those files. Default off. The CLI flags are `--test-first` and `--no-test-first` (`-TestFirst`, `-NoTestFirst`). |
 | `context` | No | Repo-relative files inlined into the Project context block, after `AGENTS.md`. A YAML list or a comma-separated line. |
+| `must_exist` | No | Paths that must exist on disk, or names that must appear in the test output, before a green test command counts. A list or a comma-separated line. Unset means no extra check. |
+| `plan_turns` | No | Turn budget for the plan phase. Default 8. A profile override or `runtime\overrides.json` key of the same name is used when the task omits it. The task wins over the profile. A caller that passes a non-default plan budget (the eval runner does) wins over the task. |
+| `implement_turns` | No | Turn budget for implement, fix, and review-fix. Default 30. Same precedence as `plan_turns`. |
+| `exploration_cap` | No | Consecutive read-only or probing tool calls without a file write before the harness says to stop exploring and write. Default 10. `0` disables the cap. |
+| `exploration_bonus_turns` | No | Extra turns, once, when a phase hits its budget by reading and probing instead of editing. Default 0. |
+| `cheat_sheet_marker` | No | Extra heading substring, matched case-insensitively, whose section is injected verbatim into implement, fix, and review-fix. The default marker is `cheat sheet`. |
+| `blocked_probes` | No | Extra regular expressions refused as shell commands, added to the built-in probe list (ilspycmd, `dotnet new`, reflection loads, and similar). |
+| `api_error_patterns` | No | Extra substrings that mark a build or compile failure as API misuse. The defaults are `CS1503`, `CS0214`, `CS1061`, and `CS0117`. A match re-injects the cheat sheet into the fix prompt. |
+| `scratch_dirs` | No | Extra directory names the model may not create unless the plan names that path. Defaults include `diag`, `apicheck`, `api-check`, `_probe`, `scratch`, and `throwaway`. |
+
+A task file may start with a UTF-8 BOM. It is stripped before front matter is read. If the file starts with `---` and has no closing `---`, `validate` reports that the front matter could not be parsed instead of a missing `test_command`.
+
+`plan_turns`, `implement_turns`, `exploration_cap`, `exploration_bonus_turns`, and `cheat_sheet_marker` may also sit in the target repo's `AGENTS.md` front matter. A key set on the task wins, then `AGENTS.md`, then the profile.
 
 The same smoke keys can sit in the front matter of the target repo's `AGENTS.md`. A key set on the task wins. `validate` prints a warning, and still exits 0, when a task mentions a GUI toolkit or a server and neither the task nor `AGENTS.md` sets `smoke_command`. Other tasks are not warned about.
 

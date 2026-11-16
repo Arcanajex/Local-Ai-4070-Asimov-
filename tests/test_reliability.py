@@ -304,13 +304,18 @@ def test_retry_starts_r2_with_the_failure_and_stop_file_blocks_it(tmp_path):
         "# Marker\n\n## Goal\n\nCreate ok.txt.\n\n## Acceptance criteria\n\n- [ ] ok.txt exists\n\n## Out of scope\n\n- none\n"
     )
 
+    wrote = {"n": 0}
+
     class Client:
         def chat(self, messages, *, tools, max_tokens):
             prompt = next(message["content"] for message in messages if message["role"] == "user")
             if "Review the diff" in prompt:
                 return _text(_accept())
             if "Previous attempt" in prompt and "Implement the task." in prompt:
-                return _call("write", {"path": "ok.txt", "content": "ok\n"})
+                wrote["n"] += 1
+                if wrote["n"] == 1:
+                    return _call("write", {"path": "ok.txt", "content": "ok\n"})
+                return _text("wrote ok.txt")
             return _text("plan only")
 
     result = run_with_retries(
@@ -443,14 +448,16 @@ def test_eval_mock_scoreboard(tmp_path):
         "two-criteria",
         "off-by-one",
         "default-on",
+        "false-pass",
+        "leaked-review",
     }
     board = run_eval(mock=True, output_dir=tmp_path)
     assert board.ok, board.summary()
-    assert len(board.results) == 9
+    assert len(board.results) == 11
     assert board.path is not None and board.path.is_file()
     saved = json.loads(board.path.read_text(encoding="utf-8"))
     assert saved["mode"] == "mock"
-    assert saved["passed"] == 9
+    assert saved["passed"] == 11
     code = main(["eval", "--mock", "--only", "default-on", "--output-dir", str(tmp_path / "cli")])
     assert code == 0
 

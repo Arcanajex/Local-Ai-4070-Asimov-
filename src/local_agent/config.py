@@ -38,6 +38,15 @@ OVERRIDABLE = {
     "cache_type_v",
     "preserve_thinking",
     "reasoning_replay_turns",
+    # Agent-loop knobs. The tuner does not write these; a hand edit may.
+    "plan_turns",
+    "implement_turns",
+    "exploration_cap",
+    "exploration_bonus_turns",
+    "api_misuse_patterns",
+    "cheat_sheet_markers",
+    "extra_probe_patterns",
+    "extra_scratch_markers",
 }
 
 
@@ -92,6 +101,16 @@ class Profile:
     notes: str = ""
     expected: dict[str, Any] = field(default_factory=dict)
     raw: dict[str, Any] = field(default_factory=dict)
+    # Harness budgets. Missing catalog keys keep these defaults so old
+    # profiles and overrides files still load.
+    plan_turns: int = 8
+    implement_turns: int = 30
+    exploration_cap: int = 10
+    exploration_bonus_turns: int = 0
+    api_misuse_patterns: list[str] = field(default_factory=list)
+    cheat_sheet_markers: list[str] = field(default_factory=list)
+    extra_probe_patterns: list[str] = field(default_factory=list)
+    extra_scratch_markers: list[str] = field(default_factory=list)
 
     @property
     def offload_flag(self) -> str:
@@ -153,6 +172,16 @@ def _as_int(value: Any, key: str) -> int:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{key} must be a number, got {value!r}")
     return int(value)
+
+
+def _as_str_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
+    if isinstance(value, (list, tuple)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    raise ValueError(f"expected a list of strings, got {value!r}")
 
 
 def profile_from_dict(name: str, data: dict[str, Any], defaults: dict[str, Any]) -> Profile:
@@ -225,6 +254,16 @@ def profile_from_dict(name: str, data: dict[str, Any], defaults: dict[str, Any])
         notes=str(merged.get("notes", "")),
         expected=dict(merged.get("expected") or {}),
         raw=merged,
+        plan_turns=_as_int(merged.get("plan_turns", 8), "plan_turns"),
+        implement_turns=_as_int(merged.get("implement_turns", 30), "implement_turns"),
+        exploration_cap=_as_int(merged.get("exploration_cap", 10), "exploration_cap"),
+        exploration_bonus_turns=_as_int(
+            merged.get("exploration_bonus_turns", 0), "exploration_bonus_turns"
+        ),
+        api_misuse_patterns=_as_str_list(merged.get("api_misuse_patterns")),
+        cheat_sheet_markers=_as_str_list(merged.get("cheat_sheet_markers")),
+        extra_probe_patterns=_as_str_list(merged.get("extra_probe_patterns")),
+        extra_scratch_markers=_as_str_list(merged.get("extra_scratch_markers")),
     )
 
 

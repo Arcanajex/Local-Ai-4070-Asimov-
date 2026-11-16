@@ -21,6 +21,15 @@ from local_agent.client import (
 )
 from local_agent.config import Profile
 from local_agent.context import compact_messages, prompt_budget
+from local_agent.guardrails import (
+    EXPLORATION_ESCALATION,
+    PLAIN_TEXT_REMINDER,
+    PhaseGuard,
+    has_leaked_tool_markup,
+    is_exploration_call,
+    strip_leaked_tool_markup,
+    tool_block_reason,
+)
 from local_agent.logging_util import RunLogger
 from local_agent.loop_detect import WARNING_TEXT, LoopDetector
 from local_agent.prompts import system_prompt
@@ -57,18 +66,55 @@ class AgentHarness:
         *,
         max_turns: int,
         deadline: float | None = None,
+        guard: PhaseGuard | None = None,
     ) -> PhaseResult:
+        guard = guard or PhaseGuard(exploration_cap=self.profile.exploration_cap)
         schemas = tool_schemas(self.allowed_tools)
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": system_prompt()},
+            {"role": "system", "content": system_prompt(guard.cheat_sheet)},
             {"role": "user", "content": user_prompt},
         ]
         detector = LoopDetector()
         final_content = ""
-        for turn in range(1, max_turns + 1):
+        turn = 0
+        limit = max_turns
+        bonus_applied = False
+        format_retries = 0
+        streak = 0
+        writes = 0
+        explore_calls = 0
+        nudged = False
+        escalated = False
+        refused_explores = 0
+        cap = guard.exploration_cap
+        while True:
             if deadline is not None and time.monotonic() >= deadline:
                 self.logger.event("phase_stop", status="time_budget", summary="deadline before turn")
-                return PhaseResult("time_budget", final_content, turn - 1, messages)
+                return PhaseResult("time_budget", final_content, turn, messages)
+            if turn >= limit:
+                if self._grant_exploration_bonus(
+                    guard,
+                    bonus_applied=bonus_applied,
+                    writes=writes,
+                    explore_calls=explore_calls,
+                ):
+                    bonus_applied = True
+                    limit += guard.exploration_bonus_turns
+                    escalated = False
+                    refused_explores = 0
+                    streak = 0
+                    nudged = False
+                    messages.append({"role": "user", "content": guard.nudge_text()})
+                    self.logger.event(
+                        "exploration_bonus",
+                        turns=guard.exploration_bonus_turns,
+                        summary=f"bonus {guard.exploration_bonus_turns} turns after exploration",
+                    )
+                    continue
+                self.logger.event("phase_stop", status="turn_budget", summary=f"hit {max_turns} turns")
+                return PhaseResult("turn_budget", final_content, turn, messages)
+
+            turn += 1
             result, messages = self._complete(messages, schemas)
             self.logger.event(
                 "assistant",
@@ -84,11 +130,11 @@ class AgentHarness:
                 summary=_summary(result),
             )
             if result.empty:
-                nudged = self._nudge_empty(messages, schemas, result)
-                if nudged is None:
+                nudged_empty = self._nudge_empty(messages, schemas, result)
+                if nudged_empty is None:
                     self.logger.event("phase_stop", status="empty_reply", summary="empty after retry and nudge")
                     return PhaseResult("empty_reply", final_content, turn, messages)
-                result, messages = nudged
+                result, messages = nudged_empty
                 if result.empty:
                     self.logger.event("phase_stop", status="empty_reply", summary="empty after nudge")
                     return PhaseResult("empty_reply", final_content, turn, messages)
@@ -99,9 +145,40 @@ class AgentHarness:
                 return PhaseResult("loop_detected", result.content, turn, messages)
 
             if not result.tool_calls:
-                final_content = result.content
+                if self._reprompt_plain_text(guard, result.content, format_retries):
+                    format_retries += 1
+                    if turn >= limit:
+                        limit += 1
+                    messages.append(
+                        {"role": "assistant", "content": strip_leaked_tool_markup(result.content)}
+                    )
+                    messages.append({"role": "user", "content": self._plain_reminder(guard)})
+                    self.logger.event("plain_text_reprompt", summary="stripped leaked tool-call markup")
+                    continue
+                content = result.content
+                if guard.expect_plain_text:
+                    content = strip_leaked_tool_markup(content).strip()
+                final_content = content
                 self.logger.event("phase_stop", status="completed", summary="model stopped calling tools")
                 return PhaseResult("completed", final_content, turn, messages)
+
+            if self._plain_phase_blocks_tools(guard):
+                self.logger.event("plain_text_tool_rejected", summary="plain-text phase ignored tool calls")
+                if self._reprompt_plain_text(guard, result.content, format_retries, tool_calls=True):
+                    format_retries += 1
+                    if turn >= limit:
+                        limit += 1
+                    messages.append(
+                        assistant_message(
+                            result,
+                            include_reasoning=self.profile.reasoning_replay_turns > 0,
+                        )
+                    )
+                    messages.append({"role": "user", "content": self._plain_reminder(guard)})
+                    continue
+                content = strip_leaked_tool_markup(result.content).strip()
+                self.logger.event("phase_stop", status="completed", summary="plain-text phase stopped")
+                return PhaseResult("completed", content, turn, messages)
 
             if verdict == "warn":
                 self.logger.event("loop_warning", summary="repeated action, one more chance")
@@ -112,22 +189,25 @@ class AgentHarness:
                     include_reasoning=self.profile.reasoning_replay_turns > 0,
                 )
             )
+            stop_exploring = False
             for call in result.tool_calls:
-                if self.allowed_tools is not None and call.name not in self.allowed_tools:
-                    output = f"tool {call.name} is not available in this phase"
-                    ok = False
+                output, ok, explored, wrote = self._dispatch_call(call, guard, escalated=escalated)
+                if wrote:
+                    streak = 0
+                    writes += 1
+                    escalated = False
+                    refused_explores = 0
+                    nudged = False
+                elif explored:
+                    explore_calls += 1
+                    if escalated:
+                        refused_explores += 1
+                        if cap > 0 and refused_explores >= cap:
+                            stop_exploring = True
+                    else:
+                        streak += 1
                 else:
-                    tool_result = dispatch(call.name, call.arguments, self.workspace)
-                    output = tool_result.output
-                    ok = tool_result.ok
-                restored = self.workspace.restore_locked()
-                if restored:
-                    output += (
-                        "\nwarning: restored locked test-first file(s): "
-                        + ", ".join(restored)
-                        + ". Do not modify those tests."
-                    )
-                    ok = False
+                    streak = 0
                 self.logger.event(
                     "tool_result",
                     name=call.name,
@@ -137,12 +217,136 @@ class AgentHarness:
                     summary=f"{call.name} ok={ok}",
                 )
                 messages.append(tool_result_message(call, output))
+                if stop_exploring:
+                    break
+            if stop_exploring:
+                if self._grant_exploration_bonus(
+                    guard,
+                    bonus_applied=bonus_applied,
+                    writes=writes,
+                    explore_calls=explore_calls,
+                ):
+                    bonus_applied = True
+                    limit += guard.exploration_bonus_turns
+                    escalated = False
+                    refused_explores = 0
+                    streak = 0
+                    nudged = False
+                    messages.append({"role": "user", "content": guard.nudge_text()})
+                    self.logger.event(
+                        "exploration_bonus",
+                        turns=guard.exploration_bonus_turns,
+                        summary=f"bonus {guard.exploration_bonus_turns} turns after exploration cap",
+                    )
+                    final_content = result.content
+                    continue
+                self.logger.event(
+                    "phase_stop",
+                    status="exploration_capped",
+                    summary="exploration continued after the nudge",
+                )
+                return PhaseResult("exploration_capped", result.content, turn, messages)
+            if cap > 0 and not escalated and streak >= cap * 2:
+                escalated = True
+                messages.append({"role": "user", "content": EXPLORATION_ESCALATION})
+                self.logger.event(
+                    "exploration_escalated",
+                    streak=streak,
+                    summary="refusing further read-only calls until a write",
+                )
+            elif cap > 0 and not nudged and streak >= cap:
+                nudged = True
+                messages.append({"role": "user", "content": guard.nudge_text()})
+                self.logger.event("exploration_nudge", streak=streak, summary=guard.nudge_text())
             if verdict == "warn":
                 messages.append({"role": "user", "content": WARNING_TEXT})
             final_content = result.content
 
-        self.logger.event("phase_stop", status="turn_budget", summary=f"hit {max_turns} turns")
-        return PhaseResult("turn_budget", final_content, max_turns, messages)
+    def _plain_phase_blocks_tools(self, guard: PhaseGuard) -> bool:
+        return bool(guard.expect_plain_text and self.allowed_tools is not None and len(self.allowed_tools) == 0)
+
+    def _reprompt_plain_text(
+        self,
+        guard: PhaseGuard,
+        content: str,
+        format_retries: int,
+        *,
+        tool_calls: bool = False,
+    ) -> bool:
+        """One more plain-text try. A clean reply is not retried."""
+
+        if not guard.expect_plain_text:
+            return False
+        if format_retries >= max(0, guard.plain_text_retries):
+            return False
+        if tool_calls:
+            return True
+        return has_leaked_tool_markup(content)
+
+    def _plain_reminder(self, guard: PhaseGuard) -> str:
+        return guard.plain_text_reminder.strip() or PLAIN_TEXT_REMINDER
+
+    def _grant_exploration_bonus(
+        self,
+        guard: PhaseGuard,
+        *,
+        bonus_applied: bool,
+        writes: int,
+        explore_calls: int,
+    ) -> bool:
+        """One extra budget when the phase read and probed instead of editing."""
+
+        return (
+            not bonus_applied
+            and guard.exploration_bonus_turns > 0
+            and writes == 0
+            and explore_calls > 0
+        )
+
+    def _dispatch_call(
+        self,
+        call: Any,
+        guard: PhaseGuard,
+        *,
+        escalated: bool,
+    ) -> tuple[str, bool, bool, bool]:
+        """Returns output, ok, counts_as_exploration, counts_as_write."""
+
+        explored = is_exploration_call(
+            call.name,
+            call.arguments,
+            probe_patterns=guard.probe_patterns(),
+            scaffold_patterns=guard.scaffold_patterns(),
+        )
+        if escalated and explored:
+            return EXPLORATION_ESCALATION, False, True, False
+        blocked = tool_block_reason(
+            call.name,
+            call.arguments,
+            root=self.workspace.root,
+            plan_paths=guard.plan_paths,
+            probe_patterns=guard.probe_patterns(),
+            scaffold_patterns=guard.scaffold_patterns(),
+            scratch_markers=guard.scratch_markers(),
+            project_suffixes=guard.project_suffixes(),
+        )
+        if blocked:
+            return blocked, False, explored or call.name == "shell", False
+        if self.allowed_tools is not None and call.name not in self.allowed_tools:
+            return f"tool {call.name} is not available in this phase", False, explored, False
+        tool_result = dispatch(call.name, call.arguments, self.workspace)
+        output = tool_result.output
+        ok = tool_result.ok
+        restored = self.workspace.restore_locked()
+        if restored:
+            output += (
+                "\nwarning: restored locked test-first file(s): "
+                + ", ".join(restored)
+                + ". Do not modify those tests."
+            )
+            ok = False
+        wrote = bool(ok and call.name in {"write", "edit"})
+        return output, ok, explored and not wrote, wrote
 
     def _complete(
         self,

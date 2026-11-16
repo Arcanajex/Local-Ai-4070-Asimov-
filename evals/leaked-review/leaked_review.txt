@@ -1,0 +1,13 @@
+Let me read the existing files first.
+<tool_call>
+<tool_call>
+<tool_call>
+<tool_call>
+</tool_call>
+<tool_call>
+<function=read>
+<parameter=path>
+src/Game.cs
+</parameter>
+</function>
+</tool_call>

@@ -10,6 +10,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from local_agent.guardrails import has_leaked_tool_markup
+
 REQUIRED_SECTIONS = ("Goal", "Acceptance criteria", "Out of scope")
 _PY_MARKERS = (
     "pyproject.toml",
@@ -168,10 +170,15 @@ def validate_task_warnings(task: Any, project: Path | None = None) -> list[str]:
 def validate_task(task: Any, project: Path) -> list[str]:
     label = task.path.name if task.path else task.title or "task"
     problems: list[str] = []
+    front_error = getattr(task, "front_matter_error", None)
+    if front_error:
+        problems.append(f"{label}: {front_error}")
     for section in REQUIRED_SECTIONS:
         if not heading_exists(task.body, section):
             problems.append(f"{label}: missing section: {section}")
-    if not task.test_command_explicit and not project_is_python(project):
+    # A front-matter parse failure already explains a missing test_command.
+    # Reporting it again hides the real problem (a BOM used to do that).
+    if not front_error and not task.test_command_explicit and not project_is_python(project):
         problems.append(
             f"{label}: test_command is required because this project is not Python "
             "(Python projects default to pytest)"
@@ -223,6 +230,33 @@ def collect_task_paths(target: Path) -> list[Path]:
     if target.is_file():
         return [target]
     raise FileNotFoundError(f"task path does not exist: {target}")
+
+
+def review_form_problems(text: str, *, require_test_coverage: bool = False) -> list[str]:
+    """Why a review reply cannot be treated as a rejection.
+
+    Leaked tool-call markup, or a missing required section, means the model
+    did not produce a review. That must be re-prompted. It must not be handed
+    to review-fix, which would rewrite the tree from a non-review.
+    """
+
+    problems: list[str] = []
+    if has_leaked_tool_markup(text):
+        problems.append("review contains tool-call markup and this phase has no tools")
+    if not heading_exists(text, "Acceptance criteria"):
+        problems.append("review omitted the Acceptance criteria section")
+    if not heading_exists(text, "Out-of-scope files touched"):
+        problems.append("review omitted the Out-of-scope files touched section")
+    if not heading_exists(text, "Conflicts with AGENTS.md or decisions"):
+        problems.append("review omitted the Conflicts with AGENTS.md or decisions section")
+    if require_test_coverage:
+        if not heading_exists(text, "Tests vs criteria"):
+            problems.append("review omitted the Tests vs criteria section")
+        else:
+            section = extract_section(text, "Tests vs criteria")
+            if not re.search(r"(?im)^coverage:\s*(ok|gap)\b", section):
+                problems.append("review omitted Coverage: ok or Coverage: gap")
+    return problems
 
 
 def review_problems(text: str, *, require_test_coverage: bool = False) -> list[str]:
