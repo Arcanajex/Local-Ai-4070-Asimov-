@@ -49,7 +49,9 @@ _PLAIN_HEADINGS = {
     "tests",
     "tests vs criteria",
     "risks",
+    "findings",
     "verdict",
+    "harness note",
 }
 
 # Substrings that mean a task launches a window, a GUI toolkit, or a server.
@@ -77,7 +79,14 @@ def _heading(line: str) -> tuple[int, str] | None:
     stripped = line.strip()
     match = re.match(r"^(#{1,6})\s+(.*)$", stripped)
     if match:
-        return len(match.group(1)), match.group(2).strip().rstrip(":").lower()
+        title = match.group(2).strip().rstrip(":").lower()
+        if title == "verdict" or title.startswith("verdict "):
+            title = "verdict"
+        return len(match.group(1)), title
+    # "Verdict: fix" is the heading, not a body line of the previous section.
+    # The word after the colon is the vote, and it is read separately.
+    if re.match(r"(?i)^verdict\b", stripped):
+        return 2, "verdict"
     plain = stripped.rstrip(":").strip().lower()
     if plain in _PLAIN_HEADINGS:
         return 2, plain
