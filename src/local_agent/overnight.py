@@ -14,7 +14,7 @@ import re
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -22,6 +22,23 @@ from typing import Any
 from local_agent.client import ChatClient
 from local_agent.config import Profile, get_profile
 from local_agent.context import shrink_text
+from local_agent.guardrails import (
+    DEFAULT_API_MISUSE,
+    DEFAULT_CHEAT_MARKERS,
+    DEFAULT_EXPLORATION_CAP,
+    DEFAULT_IMPLEMENT_TURNS,
+    DEFAULT_PLAN_TURNS,
+    PLAN_EXPLORATION_NUDGE,
+    PhaseGuard,
+    collect_cheat_sheets,
+    implementation_gap,
+    looks_like_api_misuse,
+    missing_must_exist,
+    planned_paths,
+    resolve_optional_int,
+    resolve_turn_budget,
+    strip_leaked_tool_markup,
+)
 from local_agent.harness import AgentHarness, PhaseResult
 from local_agent.logging_util import RunLogger
 from local_agent.project_context import (
@@ -35,13 +52,21 @@ from local_agent.prompts import (
     implement_prompt,
     plan_prompt,
     review_fix_prompt,
+    review_format_reminder,
     review_prompt,
     test_first_prompt,
     test_first_repair_prompt,
 )
+from local_agent.snapshots import Snapshot, create_snapshot, restore_snapshot
 from local_agent.repo_map import build_repo_map
 from local_agent.smoke_gate import run_smoke
-from local_agent.taskcheck import extract_section, format_problems, review_problems, validate_task
+from local_agent.taskcheck import (
+    extract_section,
+    format_problems,
+    review_form_problems,
+    review_problems,
+    validate_task,
+)
 from local_agent.test_first import (
     changed_rels,
     classify_test_run,
@@ -61,7 +86,20 @@ _FRONT_MATTER = re.compile(r"\A---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 # full 1.6x of the 40K -> 64K context change.
 REVIEW_DIFF_CHARS = 32_000
 FIX_DIFF_CHARS = 8_000
-RETRYABLE_STATUSES = {"iteration_budget", "loop_detected", "review_failed"}
+RETRYABLE_STATUSES = {
+    "iteration_budget",
+    "loop_detected",
+    "review_failed",
+    "false_pass",
+    "review_malformed",
+    "review_fix_reverted",
+    "restored_snapshot",
+}
+_LIST_KEYS = {"context", "must_exist", "blocked_probes", "api_error_patterns", "scratch_dirs"}
+_FRONT_MATTER_ERROR = (
+    "front matter could not be parsed: the file starts with --- but there is no closing ---. "
+    "A UTF-8 BOM is stripped before parsing; the closing line must be exactly ---."
+)
 
 
 @dataclass
@@ -80,6 +118,16 @@ class TaskSpec:
     smoke_fail_on_traceback: bool = True
     test_first: bool = False
     explicit_keys: set[str] = field(default_factory=set)
+    must_exist: list[str] = field(default_factory=list)
+    plan_turns: int | None = None
+    implement_turns: int | None = None
+    exploration_cap: int | None = None
+    exploration_bonus_turns: int | None = None
+    cheat_sheet_marker: str = ""
+    blocked_probes: list[str] = field(default_factory=list)
+    api_error_patterns: list[str] = field(default_factory=list)
+    scratch_dirs: list[str] = field(default_factory=list)
+    front_matter_error: str | None = None
 
 
 @dataclass
@@ -99,10 +147,12 @@ class OvernightResult:
     stop_requested: bool = False
     test_output: str = ""
     review: str = ""
+    snapshot_refs: list[str] = field(default_factory=list)
+    restored_snapshot: str = ""
 
 
 def parse_task(text: str, path: Path | None = None) -> TaskSpec:
-    meta, context_paths, body = _split_front_matter(text)
+    meta, lists, body, error = _split_front_matter(text)
     title = _title(body) or (path.stem if path else "task")
     explicit = "test_command" in meta
     test_command = str(meta["test_command"]) if explicit else "python -m pytest -q"
@@ -118,7 +168,7 @@ def parse_task(text: str, path: Path | None = None) -> TaskSpec:
         lint_command=lint_command,
         path=path,
         test_command_explicit=explicit,
-        context_paths=context_paths,
+        context_paths=lists.get("context", []),
         smoke_command=meta.get("smoke_command") or None,
         smoke_mode=smoke_mode,
         smoke_timeout=_meta_int(meta.get("smoke_timeout"), 120),
@@ -127,27 +177,45 @@ def parse_task(text: str, path: Path | None = None) -> TaskSpec:
             _truthy(meta["smoke_fail_on_traceback"]) if "smoke_fail_on_traceback" in meta else True
         ),
         test_first=_truthy(meta["test_first"]) if "test_first" in meta else False,
-        explicit_keys=set(meta),
+        explicit_keys=set(meta) | {key for key, values in lists.items() if values},
+        must_exist=lists.get("must_exist", []),
+        plan_turns=_optional_int(meta, "plan_turns"),
+        implement_turns=_optional_int(meta, "implement_turns"),
+        exploration_cap=_optional_int(meta, "exploration_cap"),
+        exploration_bonus_turns=_optional_int(meta, "exploration_bonus_turns"),
+        cheat_sheet_marker=meta.get("cheat_sheet_marker", ""),
+        blocked_probes=lists.get("blocked_probes", []),
+        api_error_patterns=lists.get("api_error_patterns", []),
+        scratch_dirs=lists.get("scratch_dirs", []),
+        front_matter_error=error,
     )
 
 
 def load_task(path: Path) -> TaskSpec:
-    return parse_task(Path(path).read_text(encoding="utf-8"), Path(path))
+    # utf-8-sig drops a leading BOM. A BOM used to hide the front matter, and
+    # validate then reported a missing test_command instead of the real cause.
+    return parse_task(Path(path).read_text(encoding="utf-8-sig"), Path(path))
 
 
-def _split_front_matter(text: str) -> tuple[dict[str, str], list[str], str]:
-    match = _FRONT_MATTER.match(text)
+def _split_front_matter(text: str) -> tuple[dict[str, str], dict[str, list[str]], str, str | None]:
+    text = text.lstrip("\ufeff")
+    if text.startswith("---"):
+        match = _FRONT_MATTER.match(text)
+        if not match:
+            return {}, {key: [] for key in _LIST_KEYS}, text, _FRONT_MATTER_ERROR
+    else:
+        match = None
     if not match:
-        return {}, [], text
-    meta, context_paths = _parse_front_matter(match.group(1))
-    return meta, context_paths, text[match.end() :]
+        return {}, {key: [] for key in _LIST_KEYS}, text, None
+    meta, lists = _parse_front_matter(match.group(1))
+    return meta, lists, text[match.end() :], None
 
 
-def _parse_front_matter(block: str) -> tuple[dict[str, str], list[str]]:
-    """Line-oriented front matter, including a `context` list."""
+def _parse_front_matter(block: str) -> tuple[dict[str, str], dict[str, list[str]]]:
+    """Line-oriented front matter, including list keys such as `context` and `must_exist`."""
 
     meta: dict[str, str] = {}
-    context: list[str] = []
+    lists: dict[str, list[str]] = {key: [] for key in _LIST_KEYS}
     lines = block.splitlines()
     index = 0
     while index < len(lines):
@@ -161,20 +229,20 @@ def _parse_front_matter(block: str) -> tuple[dict[str, str], list[str]]:
         key, value = line.split(":", 1)
         key = key.strip()
         value = value.strip().strip('"').strip("'")
-        if key == "context" and not value:
+        if key in _LIST_KEYS and not value:
             index += 1
             while index < len(lines) and lines[index].lstrip().startswith("- "):
                 item = lines[index].lstrip()[2:].strip().strip('"').strip("'")
                 if item:
-                    context.append(item)
+                    lists[key].append(item)
                 index += 1
             continue
-        if key == "context":
-            context.extend(part.strip() for part in value.split(",") if part.strip())
+        if key in _LIST_KEYS:
+            lists[key].extend(part.strip() for part in value.split(",") if part.strip())
         else:
             meta[key] = value
         index += 1
-    return meta, context
+    return meta, lists
 
 
 def _truthy(value: str) -> bool:
@@ -199,6 +267,15 @@ def _meta_float(value: str | None, default: float) -> float:
         return default
 
 
+def _optional_int(meta: dict[str, str], key: str) -> int | None:
+    if key not in meta or str(meta.get(key) or "").strip() == "":
+        return None
+    try:
+        return int(float(meta[key]))
+    except (TypeError, ValueError):
+        return None
+
+
 def agents_front_matter(project: Path) -> dict[str, str]:
     """Front matter of the target repo's AGENTS.md, or {} when it has none."""
 
@@ -209,7 +286,9 @@ def agents_front_matter(project: Path) -> dict[str, str]:
         text = path.read_text(encoding="utf-8")
     except OSError:
         return {}
-    meta, _context, _body = _split_front_matter(text)
+    meta, _lists, _body, error = _split_front_matter(text)
+    if error:
+        return {}
     return meta
 
 
@@ -234,6 +313,16 @@ def apply_project_defaults(task: TaskSpec, project: Path) -> TaskSpec:
         task.smoke_fail_on_traceback = _truthy(meta["smoke_fail_on_traceback"])
     if "test_first" not in task.explicit_keys and "test_first" in meta:
         task.test_first = _truthy(meta["test_first"])
+    if task.plan_turns is None and "plan_turns" in meta:
+        task.plan_turns = _optional_int(meta, "plan_turns")
+    if task.implement_turns is None and "implement_turns" in meta:
+        task.implement_turns = _optional_int(meta, "implement_turns")
+    if task.exploration_cap is None and "exploration_cap" in meta:
+        task.exploration_cap = _optional_int(meta, "exploration_cap")
+    if task.exploration_bonus_turns is None and "exploration_bonus_turns" in meta:
+        task.exploration_bonus_turns = _optional_int(meta, "exploration_bonus_turns")
+    if not task.cheat_sheet_marker and meta.get("cheat_sheet_marker"):
+        task.cheat_sheet_marker = meta["cheat_sheet_marker"]
     return task
 
 
@@ -290,8 +379,22 @@ def run_overnight(
     review_text = ""
     use_test_first = False
     test_first_files = ""
+    snapshots: list[Snapshot] = []
+    restored_snapshot = ""
+    restore_note = {"ref": ""}
     try:
         apply_project_defaults(task, project)
+        max_plan_turns = resolve_turn_budget(
+            max_plan_turns, DEFAULT_PLAN_TURNS, task.plan_turns, profile.plan_turns
+        )
+        max_work_turns = resolve_turn_budget(
+            max_work_turns, DEFAULT_IMPLEMENT_TURNS, task.implement_turns, profile.implement_turns
+        )
+        exploration_cap = resolve_optional_int(
+            task.exploration_cap,
+            profile.exploration_cap if profile.exploration_cap is not None else DEFAULT_EXPLORATION_CAP,
+        )
+        exploration_bonus = resolve_optional_int(task.exploration_bonus_turns, profile.exploration_bonus_turns)
         use_test_first = task.test_first if test_first is None else bool(test_first)
         identity_note = ensure_repository(project, init_repo=init_repo) or ""
         if identity_note:
@@ -329,7 +432,35 @@ def run_overnight(
             summary=f"project context {len(context_block)} chars",
         )
         branch = _create_branch(project, slugify(task.title), attempt=branch_attempt)
-        logger.event("run_start", branch=branch, profile=profile.name, task=task.title, summary=branch)
+        markers = list(profile.cheat_sheet_markers) or list(DEFAULT_CHEAT_MARKERS)
+        if task.cheat_sheet_marker and task.cheat_sheet_marker.lower() not in {item.lower() for item in markers}:
+            markers.append(task.cheat_sheet_marker)
+        cheat_sheet = collect_cheat_sheets(project, task.context_paths, markers)
+        api_patterns = tuple(profile.api_misuse_patterns) or DEFAULT_API_MISUSE
+        if task.api_error_patterns:
+            api_patterns = tuple(dict.fromkeys((*api_patterns, *task.api_error_patterns)))
+        extra_probes = tuple(dict.fromkeys((*profile.extra_probe_patterns, *task.blocked_probes)))
+        extra_scratch = tuple(dict.fromkeys((*profile.extra_scratch_markers, *task.scratch_dirs)))
+        logger.event(
+            "run_start",
+            branch=branch,
+            profile=profile.name,
+            task=task.title,
+            plan_turns=max_plan_turns,
+            implement_turns=max_work_turns,
+            exploration_cap=exploration_cap,
+            cheat_sheet_chars=len(cheat_sheet),
+            summary=branch,
+        )
+        plan_guard = PhaseGuard(
+            exploration_cap=exploration_cap,
+            exploration_bonus_turns=exploration_bonus,
+            expect_plain_text=True,
+            plain_text_retries=2,
+            nudge=PLAN_EXPLORATION_NUDGE,
+            extra_probe_patterns=extra_probes,
+            extra_scratch_markers=extra_scratch,
+        )
 
         plan = _run_phase(
             client, workspace, logger, profile,
@@ -338,14 +469,30 @@ def run_overnight(
             max_turns=max_plan_turns,
             deadline=deadline,
             phase="plan",
+            guard=plan_guard,
         )
         plan_status = plan.status
-        plan_text = plan.content.strip() or "(the model did not return a plan)"
+        plan_text = strip_leaked_tool_markup(plan.content).strip() or "(the model did not return a plan)"
         _write_agent_file(project, PLAN_FILE, _plan_document(task, plan_text))
+        plan_file_paths = tuple(planned_paths(plan_text))
+        logger.event(
+            "plan_paths",
+            paths=list(plan_file_paths),
+            summary=", ".join(plan_file_paths[:12]) or "(none)",
+        )
+        probe_guard = PhaseGuard(
+            exploration_cap=exploration_cap,
+            exploration_bonus_turns=exploration_bonus,
+            plan_paths=plan_file_paths,
+            extra_probe_patterns=extra_probes,
+            extra_scratch_markers=extra_scratch,
+        )
+        work_guard = replace(probe_guard, cheat_sheet=cheat_sheet)
 
         if use_test_first and time.monotonic() < deadline:
             test_first_files = _run_test_first(
-                client, workspace, logger, profile, task, project, context_block, deadline, max_work_turns, test_cmd
+                client, workspace, logger, profile, task, project, context_block, deadline, max_work_turns, test_cmd,
+                guard=probe_guard,
             )
 
         if time.monotonic() >= deadline:
@@ -364,11 +511,27 @@ def run_overnight(
             max_turns=max_work_turns,
             deadline=deadline,
             phase="implement",
+            guard=work_guard,
         )
         tests_passed = False
         test_output = ""
         iterations = 0
         stop_status = implement.status
+        implement_incomplete = implement.status in {"turn_budget", "exploration_capped"}
+
+        def acceptance_block(incomplete: bool) -> str | None:
+            reasons: list[str] = []
+            if incomplete:
+                reasons.append(
+                    "implement stopped on the turn budget or the exploration cap before it finished"
+                )
+            gap = implementation_gap(plan_text, working_tree_diff(project))
+            if gap:
+                reasons.append(gap)
+            if not reasons:
+                return None
+            return " ".join(reasons)
+
         for iterations in range(1, max_iterations + 1):
             if time.monotonic() >= deadline:
                 stop_status = "time_budget"
@@ -378,6 +541,45 @@ def run_overnight(
             )
             smoke_ran = smoke_ran or ran_smoke
             if tests_passed and smoke_passed:
+                gap_reason = acceptance_block(implement_incomplete)
+                if gap_reason:
+                    logger.event("false_pass", iteration=iterations, summary=gap_reason[:500])
+                    if iterations == max_iterations:
+                        stop_status = "false_pass"
+                        tests_passed = False
+                        test_output = (
+                            test_output
+                            + "\n\nFalse pass: "
+                            + gap_reason
+                            + "\nPassing tests were not counted.\n"
+                        )
+                        break
+                    implement_incomplete = False
+                    fix = _run_phase(
+                        client, workspace, logger, profile,
+                        with_project_context(
+                            _fix_user_prompt(
+                                task,
+                                project,
+                                test_output,
+                                smoke_failed=False,
+                                false_pass_reason=gap_reason,
+                                cheat_sheet=cheat_sheet,
+                                api_patterns=api_patterns,
+                            ),
+                            context_block,
+                        ),
+                        allowed=None,
+                        max_turns=max_work_turns,
+                        deadline=deadline,
+                        phase=f"fix-{iterations}",
+                        guard=work_guard,
+                    )
+                    if fix.status in {"empty_reply", "loop_detected"}:
+                        stop_status = fix.status
+                        break
+                    continue
+                _record_snapshot(project, branch, snapshots, logger)
                 stop_status = "passed"
                 break
             if iterations == max_iterations:
@@ -394,6 +596,8 @@ def run_overnight(
                         project,
                         test_output,
                         smoke_failed=tests_passed and not smoke_passed,
+                        cheat_sheet=cheat_sheet,
+                        api_patterns=api_patterns,
                     ),
                     context_block,
                 ),
@@ -401,8 +605,9 @@ def run_overnight(
                 max_turns=max_work_turns,
                 deadline=deadline,
                 phase=f"fix-{iterations}",
+                guard=work_guard,
             )
-            if fix.status in {"time_budget", "empty_reply", "loop_detected"}:
+            if fix.status in {"time_budget", "empty_reply", "loop_detected", "exploration_capped"}:
                 stop_status = fix.status
                 # Still run the checks once more if the model managed to edit before stopping.
                 if fix.status != "time_budget":
@@ -410,7 +615,8 @@ def run_overnight(
                         project, test_cmd, lint_cmd, task, logger, iterations
                     )
                     smoke_ran = smoke_ran or ran_smoke
-                    if tests_passed and smoke_passed:
+                    if tests_passed and smoke_passed and not acceptance_block(False):
+                        _record_snapshot(project, branch, snapshots, logger)
                         stop_status = "passed"
                 break
         else:
@@ -437,10 +643,43 @@ def run_overnight(
                     test_command=test_cmd,
                     lint_command=lint_cmd,
                     test_first_files=test_first_files,
+                    work_guard=work_guard,
+                    snapshots=snapshots,
+                    branch=branch,
+                    restore_note=restore_note,
                 )
             )
-        if tests_passed and smoke_passed and review_passed:
-            report_status = "passed"
+        if restore_note["ref"] and not restored_snapshot:
+            restored_snapshot = restore_note["ref"]
+        if snapshots and not (tests_passed and smoke_passed):
+            restored = _restore_last_snapshot(project, snapshots[-1], logger)
+            if restored:
+                restored_snapshot = restored
+                test_output, tests_passed, smoke_passed, ran_smoke = _run_iteration_checks(
+                    project, test_cmd, lint_cmd, task, logger, "restore"
+                )
+                smoke_ran = smoke_ran or ran_smoke
+                review_text = (
+                    (review_text or "").rstrip()
+                    + f"\n\nRestored the last passing snapshot {restored} because the run ended worse "
+                    "than that tree. The snapshot ref was kept.\n"
+                )
+                if stop_status != "review_fix_reverted":
+                    stop_status = "restored_snapshot"
+        kept_failure = {
+            "review_malformed",
+            "review_fix_reverted",
+            "restored_snapshot",
+        }
+        if tests_passed and smoke_passed and review_passed and stop_status not in kept_failure:
+            # A later fix can clear an earlier false pass. An empty diff cannot.
+            if implementation_gap(plan_text, working_tree_diff(project)):
+                report_status = "false_pass"
+                tests_passed = False
+            else:
+                report_status = "passed"
+        elif stop_status in kept_failure:
+            report_status = stop_status
         elif not tests_passed or not smoke_passed:
             report_status = stop_status
         else:
@@ -462,6 +701,8 @@ def run_overnight(
             review_full=review_text,
             attempt=branch_attempt,
             prior_attempt=prior_attempt,
+            snapshot_refs=[item.ref for item in snapshots],
+            restored_snapshot=restored_snapshot,
         )
     except Exception as exc:
         logger.event("run_error", summary=f"{type(exc).__name__}: {exc}")
@@ -502,14 +743,20 @@ def _review_and_maybe_fix(
     test_command: str,
     lint_command: str | None,
     test_first_files: str,
+    work_guard: PhaseGuard,
+    snapshots: list[Snapshot],
+    branch: str,
+    restore_note: dict[str, str] | None = None,
 ) -> tuple[str, bool, bool, bool, bool, str, str]:
-    """Review once. A not-met criterion or a conflict gets one fix, then a re-review.
+    """Review once. Only a well-formed review can reject the change.
 
-    Returns review text, review_passed, tests_passed, smoke_passed, smoke_ran,
-    test output, and stop status.
+    A leaked tool call or a missing section is re-prompted and, if it stays
+    malformed, is not forwarded to review-fix. A real rejection gets one fix
+    that is limited to the findings. If that fix breaks a passing tree, the
+    last passing snapshot is restored.
     """
 
-    review_text, problems = _one_review(
+    review_text, problems, malformed = _one_review(
         client,
         workspace,
         logger,
@@ -522,11 +769,20 @@ def _review_and_maybe_fix(
         test_first_files=test_first_files,
         smoke_passed=None if not smoke_ran else smoke_passed,
     )
+    if malformed:
+        logger.event("review_unusable", summary="malformed review was not sent to review-fix")
+        note = (
+            review_text.rstrip()
+            + "\n\nThe review was not usable (tool-call markup or a missing required section) "
+            "and was not sent to review-fix.\n"
+        )
+        return note, False, tests_passed, smoke_passed, smoke_ran, test_output, "review_malformed"
     if not problems:
         return review_text, True, tests_passed, smoke_passed, smoke_ran, test_output, stop_status
     logger.event("review_rejected", summary="; ".join(problems)[:500], problems=problems)
     if time.monotonic() >= deadline:
         return review_text, False, tests_passed, smoke_passed, smoke_ran, test_output, stop_status
+    passing_before = tests_passed and smoke_passed
     _run_phase(
         client, workspace, logger, profile,
         with_project_context(
@@ -537,16 +793,33 @@ def _review_and_maybe_fix(
         max_turns=max_work_turns,
         deadline=deadline,
         phase="review-fix",
+        guard=work_guard,
     )
     test_output, tests_passed, smoke_passed, ran_smoke = _run_iteration_checks(
         workspace.root, test_command, lint_command, task, logger, "review-fix"
     )
     smoke_ran = smoke_ran or ran_smoke
+    if passing_before and snapshots and (not tests_passed or not smoke_passed):
+        restored = _restore_last_snapshot(project=workspace.root, snapshot=snapshots[-1], logger=logger)
+        if restored:
+            test_output, tests_passed, smoke_passed, ran_smoke = _run_iteration_checks(
+                workspace.root, test_command, lint_command, task, logger, "review-fix-revert"
+            )
+            smoke_ran = smoke_ran or ran_smoke
+            if restore_note is not None:
+                restore_note["ref"] = restored
+            note = (
+                review_text.rstrip()
+                + "\n\nreview-fix turned a passing build or test run into a failing one. "
+                f"The tree was restored to {restored}. The snapshot ref was kept.\n"
+            )
+            return note, False, tests_passed, smoke_passed, smoke_ran, test_output, "review_fix_reverted"
     if not tests_passed or not smoke_passed:
         return review_text, False, tests_passed, smoke_passed, smoke_ran, test_output, "tests_failed"
+    _record_snapshot(workspace.root, branch, snapshots, logger)
     if time.monotonic() >= deadline:
         return review_text, False, tests_passed, smoke_passed, smoke_ran, test_output, stop_status
-    review_text, problems = _one_review(
+    review_text, problems, malformed = _one_review(
         client,
         workspace,
         logger,
@@ -559,6 +832,13 @@ def _review_and_maybe_fix(
         test_first_files=test_first_files,
         smoke_passed=None if not smoke_ran else smoke_passed,
     )
+    if malformed:
+        logger.event("review_unusable", summary="second review was malformed and was not sent to another fix")
+        note = (
+            review_text.rstrip()
+            + "\n\nThe second review was not usable and was not sent to another review-fix.\n"
+        )
+        return note, False, tests_passed, smoke_passed, smoke_ran, test_output, "review_malformed"
     return review_text, not problems, tests_passed, smoke_passed, smoke_ran, test_output, stop_status
 
 
@@ -575,28 +855,54 @@ def _one_review(
     phase: str,
     test_first_files: str = "",
     smoke_passed: bool | None = None,
-) -> tuple[str, list[str]]:
-    diff = fit_review_diff(working_tree_diff(workspace.root), REVIEW_DIFF_CHARS)
-    review = _run_phase(
-        client, workspace, logger, profile,
-        review_prompt(
+) -> tuple[str, list[str], bool]:
+    """Returns review text, substantive problems, and whether the reply is unusable.
+
+    Up to two re-prompts. A still-malformed reply is not a rejection.
+    """
+
+    require_coverage = bool(test_first_files.strip())
+    reminder = ""
+    text = ""
+    plain_guard = PhaseGuard(expect_plain_text=True, plain_text_retries=0, exploration_cap=0)
+    for attempt in range(3):
+        prompt = review_prompt(
             task.body,
-            diff,
+            fit_review_diff(working_tree_diff(workspace.root), REVIEW_DIFF_CHARS),
             tests_passed,
             acceptance=extract_section(task.body, "Acceptance criteria"),
             out_of_scope=extract_section(task.body, "Out of scope"),
             context_block=context_block,
             test_first_files=test_first_files,
-        ),
-        allowed=set(),
-        max_turns=2,
-        deadline=deadline,
-        phase=phase,
-    )
-    text = review.content.strip()
-    if smoke_passed is False and "smoke" not in text.lower():
-        text = text + "\n\nSmoke: the smoke command did not pass.\n"
-    return text, review_problems(text, require_test_coverage=bool(test_first_files.strip()))
+        )
+        if reminder:
+            prompt += "\n\n" + reminder
+        review = _run_phase(
+            client, workspace, logger, profile,
+            prompt,
+            allowed=set(),
+            max_turns=2,
+            deadline=deadline,
+            phase=phase if attempt == 0 else f"{phase}-reprompt-{attempt}",
+            guard=plain_guard,
+        )
+        text = strip_leaked_tool_markup(review.content or "").strip()
+        reasons = review_form_problems(text, require_test_coverage=require_coverage)
+        if not reasons:
+            if smoke_passed is False and "smoke" not in text.lower():
+                text = text + "\n\nSmoke: the smoke command did not pass.\n"
+            return text, review_problems(text, require_test_coverage=require_coverage), False
+        if attempt == 2:
+            break
+        logger.event(
+            "review_reprompt",
+            phase=phase,
+            attempt=attempt + 1,
+            reasons=reasons,
+            summary="; ".join(reasons)[:300],
+        )
+        reminder = review_format_reminder()
+    return text, [], True
 
 
 def _run_phase(
@@ -610,14 +916,46 @@ def _run_phase(
     max_turns: int,
     deadline: float,
     phase: str,
+    guard: PhaseGuard | None = None,
 ) -> PhaseResult:
-    logger.event("phase_start", phase=phase, summary=phase)
+    logger.event("phase_start", phase=phase, max_turns=max_turns, summary=phase)
     harness = AgentHarness(
         client, workspace, logger, profile, allowed_tools=allowed
     )
-    result = harness.run(prompt, max_turns=max_turns, deadline=deadline)
+    result = harness.run(prompt, max_turns=max_turns, deadline=deadline, guard=guard)
     logger.event("phase_end", phase=phase, status=result.status, summary=f"{phase} {result.status}")
     return result
+
+
+def _record_snapshot(project: Path, branch: str, snapshots: list[Snapshot], logger: RunLogger) -> None:
+    try:
+        snap = create_snapshot(project, branch, len(snapshots) + 1)
+    except Exception as exc:
+        logger.event("snapshot_failed", summary=f"{type(exc).__name__}: {exc}"[:500])
+        return
+    snapshots.append(snap)
+    logger.event(
+        "snapshot",
+        ref=snap.ref,
+        commit=snap.sha,
+        iteration=snap.number,
+        summary=f"snapshot {snap.ref}",
+    )
+
+
+def _restore_last_snapshot(project: Path, snapshot: Snapshot, logger: RunLogger) -> str:
+    try:
+        restore_snapshot(project, snapshot.sha)
+    except Exception as exc:
+        logger.event("snapshot_restore_failed", ref=snapshot.ref, summary=f"{type(exc).__name__}: {exc}"[:500])
+        return ""
+    logger.event(
+        "snapshot_restore",
+        ref=snapshot.ref,
+        commit=snapshot.sha,
+        summary=f"restored {snapshot.ref}",
+    )
+    return snapshot.ref
 
 
 def _run_checks(project: Path, test_command: str, lint_command: str | None) -> tuple[str, bool]:
@@ -648,6 +986,22 @@ def _run_iteration_checks(
     """
 
     output, tests_ok = _run_checks(project, test_command, lint_command)
+    if task.must_exist:
+        missing = missing_must_exist(project, task.must_exist, output)
+        logger.event(
+            "must_exist",
+            iteration=iteration,
+            missing=missing,
+            passed=not missing,
+            summary=f"must_exist missing={len(missing)}",
+        )
+        if missing:
+            tests_ok = False
+            listed = "\n".join(f"- {item}" for item in missing)
+            output += (
+                "\n\nmust_exist check failed. These paths do not exist and these names "
+                f"did not appear in the test output:\n{listed}\n"
+            )
     logger.event(
         "tests",
         iteration=iteration,
@@ -679,7 +1033,16 @@ def _run_iteration_checks(
     return failed, True, False, True
 
 
-def _fix_user_prompt(task: TaskSpec, project: Path, test_output: str, *, smoke_failed: bool) -> str:
+def _fix_user_prompt(
+    task: TaskSpec,
+    project: Path,
+    test_output: str,
+    *,
+    smoke_failed: bool,
+    false_pass_reason: str = "",
+    cheat_sheet: str = "",
+    api_patterns: tuple[str, ...] = (),
+) -> str:
     diff = fit_review_diff(working_tree_diff(project), FIX_DIFF_CHARS)
     cited = format_traceback_files(project, test_output)
     return fix_prompt(
@@ -689,6 +1052,9 @@ def _fix_user_prompt(task: TaskSpec, project: Path, test_output: str, *, smoke_f
         smoke_failed=smoke_failed,
         diff_text=diff,
         traceback_files=cited,
+        false_pass_reason=false_pass_reason,
+        cheat_sheet=cheat_sheet,
+        api_reminder=looks_like_api_misuse(test_output, api_patterns),
     )
 
 
@@ -703,6 +1069,7 @@ def _run_test_first(
     deadline: float,
     max_turns: int,
     test_command: str,
+    guard: PhaseGuard | None = None,
 ) -> str:
     """Write tests, confirm they fail for a missing implementation, then lock them.
 
@@ -723,6 +1090,7 @@ def _run_test_first(
         max_turns=max_turns,
         deadline=deadline,
         phase="test-first",
+        guard=guard,
     )
     _revert_non_tests(project, before, logger)
     test_rels = _new_test_files(project, before)
@@ -740,6 +1108,7 @@ def _run_test_first(
             max_turns=max_turns,
             deadline=deadline,
             phase="test-first-repair",
+            guard=guard,
         )
         _revert_non_tests(project, before, logger)
         test_rels = _new_test_files(project, before)
@@ -814,7 +1183,10 @@ def _finish(
     review_full: str = "",
     attempt: int = 0,
     prior_attempt: str = "",
+    snapshot_refs: list[str] | None = None,
+    restored_snapshot: str = "",
 ) -> OvernightResult:
+    refs = list(snapshot_refs or [])
     report = _render_report(
         task=task,
         profile_name=profile.name,
@@ -833,6 +1205,8 @@ def _finish(
         smoke_ran=smoke_ran,
         attempt=attempt,
         prior_attempt=prior_attempt,
+        snapshot_refs=refs,
+        restored_snapshot=restored_snapshot,
     )
     exclude_agent_dir(project)
     report_path = _write_agent_file(project, REPORT_FILE, report)
@@ -854,6 +1228,8 @@ def _finish(
         test_output=stored_output,
         review=stored_review,
         attempts=attempt or 1,
+        snapshot_refs=refs,
+        restored_snapshot=restored_snapshot,
     )
 
 
@@ -876,6 +1252,8 @@ def _render_report(
     smoke_ran: bool = False,
     attempt: int = 0,
     prior_attempt: str = "",
+    snapshot_refs: list[str] | None = None,
+    restored_snapshot: str = "",
 ) -> str:
     note = f"\n{identity_note}\n" if identity_note else ""
     questions = open_questions.strip() or "(none recorded)"
@@ -887,6 +1265,12 @@ def _render_report(
     earlier = ""
     if prior_attempt.strip():
         earlier = f"## Earlier attempt\n\n{shrink_text(prior_attempt.strip(), 2000)}\n\n"
+    snap_line = ""
+    if snapshot_refs:
+        listed = ", ".join(snapshot_refs)
+        snap_line = f"- Passing snapshots: {listed}\n"
+    if restored_snapshot:
+        snap_line += f"- Restored passing snapshot: {restored_snapshot}\n"
     return (
         f"# Agent report\n\n"
         f"- Status: {status}\n"
@@ -899,6 +1283,7 @@ def _render_report(
         f"{attempt_line}"
         f"- Test iterations: {iterations}\n"
         f"- Plan phase: {plan_status}\n"
+        f"{snap_line}"
         f"- Log: {log_dir}\n"
         f"{note}\n"
         f"{earlier}"

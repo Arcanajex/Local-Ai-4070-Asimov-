@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 
 from local_agent.cli import main
+from local_agent.client import ChatResult, ToolCall
 from local_agent.config import get_profile
 from local_agent.context import compact_messages, estimate_tokens, prompt_budget
 from local_agent.overnight import OvernightResult, fit_review_diff, load_task, parse_task, run_overnight
@@ -216,11 +217,10 @@ def test_context_reaches_every_phase_and_reports_stay_uncommitted(tmp_path):
         encoding="utf-8",
     )
     seen: list[str] = []
+    wrote = {"n": 0}
 
     class Client:
         def chat(self, messages, *, tools, max_tokens):
-            from local_agent.client import ChatResult
-
             prompt = next(message["content"] for message in messages if message["role"] == "user")
             seen.append(prompt)
             if "Review the diff" in prompt:
@@ -235,6 +235,17 @@ def test_context_reaches_every_phase_and_reports_stay_uncommitted(tmp_path):
                     tool_calls=[],
                     finish_reason="stop",
                 )
+            if "Implement the task." in prompt:
+                wrote["n"] += 1
+                if wrote["n"] == 1:
+                    return ChatResult(
+                        content="",
+                        reasoning="",
+                        tool_calls=[
+                            ToolCall(id="w", name="write", arguments={"path": "marker.txt", "content": "marker\n"})
+                        ],
+                        finish_reason="tool_calls",
+                    )
             return ChatResult(content="Plan and implement with no open questions.", reasoning="", tool_calls=[], finish_reason="stop")
 
     result = run_overnight(
@@ -273,14 +284,24 @@ def test_not_met_review_triggers_one_fix_then_can_pass(tmp_path):
         encoding="utf-8",
     )
     reviews = {"n": 0}
+    wrote = {"n": 0}
 
     class Client:
         def chat(self, messages, *, tools, max_tokens):
-            from local_agent.client import ChatResult
-
             prompt = next(message["content"] for message in messages if message["role"] == "user")
             if "The self-review rejected" in prompt:
                 return ChatResult(content="Fixed the criterion.", reasoning="", tool_calls=[], finish_reason="stop")
+            if "Implement the task." in prompt:
+                wrote["n"] += 1
+                if wrote["n"] == 1:
+                    return ChatResult(
+                        content="",
+                        reasoning="",
+                        tool_calls=[
+                            ToolCall(id="w", name="write", arguments={"path": "marker.txt", "content": "marker\n"})
+                        ],
+                        finish_reason="tool_calls",
+                    )
             if "Review the diff" in prompt:
                 reviews["n"] += 1
                 if reviews["n"] == 1:

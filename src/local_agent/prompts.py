@@ -9,9 +9,9 @@ def shell_name() -> str:
     return "PowerShell" if os.name == "nt" else "bash"
 
 
-def system_prompt() -> str:
+def system_prompt(cheat_sheet: str = "") -> str:
     shell = shell_name()
-    return (
+    base = (
         "You are a local coding agent. The repository is on disk. "
         "Accuracy matters more than speed.\n\n"
         f"The shell tool runs {shell}. Commands are killed when timeout_seconds "
@@ -30,6 +30,16 @@ def system_prompt() -> str:
         "If the task is ambiguous, do not guess. End your reply with an "
         "Open questions heading and list what is unresolved.\n"
         "When the task is done, stop calling tools and reply with a short summary."
+    )
+    sheet = cheat_sheet.strip()
+    if not sheet:
+        return base
+    return (
+        base
+        + "\n\nCheat sheet (trust this section; do not create diagnostic projects, "
+        "decompile, or probe with reflection to rediscover it):\n\n"
+        + sheet
+        + "\n"
     )
 
 
@@ -60,8 +70,18 @@ def fix_prompt(
     smoke_failed: bool = False,
     diff_text: str = "",
     traceback_files: str = "",
+    false_pass_reason: str = "",
+    cheat_sheet: str = "",
+    api_reminder: bool = False,
 ) -> str:
-    if smoke_failed:
+    if false_pass_reason.strip():
+        lead = (
+            "The test command exited 0, but that is not success. "
+            f"{false_pass_reason.strip()} "
+            "Existing tests can pass when the new code was never written. "
+            "Stop exploring. Write the files now and build early."
+        )
+    elif smoke_failed:
         lead = (
             "The smoke check failed after the tests passed. Fix the code so the real "
             "entry point runs. Do not mock the unit under test."
@@ -70,6 +90,15 @@ def fix_prompt(
         lead = "The tests failed. Fix the code."
     diff = diff_text.strip() or "(no diff)"
     cited = traceback_files.strip() or "(none)"
+    reminder = ""
+    sheet = cheat_sheet.strip()
+    if api_reminder and sheet:
+        reminder = (
+            "\n\nThe build or compile errors look like API misuse. "
+            "Follow this cheat sheet. Do not create a diagnostic project, "
+            "decompile, or probe with reflection.\n\n"
+            f"{sheet}\n"
+        )
     return (
         f"{lead} Read the files you need, edit them, and run the tests again. "
         "Re-check every acceptance criterion before you stop. "
@@ -78,6 +107,7 @@ def fix_prompt(
         f"Diff (stat, then a capped patch):\n{diff}\n\n"
         f"Files mentioned in the traceback:\n{cited}\n\n"
         f"Test output:\n{test_output}\n\nTASK:\n{task}"
+        f"{reminder}"
     )
 
 
@@ -154,12 +184,29 @@ def review_prompt(
     )
 
 
+def review_format_reminder() -> str:
+    """Appended when a review reply is tool markup or is missing its sections."""
+
+    return (
+        "Your previous reply was not a usable review. This phase has no tools. "
+        "Do not emit <tool_call> tags, </tool_call> tags, or any other tool markup. "
+        "Write the review from the diff and the project context already in this prompt. "
+        "Do not ask to read files. Use these exact headings, each on its own line:\n"
+        "Acceptance criteria:\n"
+        "Out-of-scope files touched:\n"
+        "Conflicts with AGENTS.md or decisions:\n"
+        "Verdict: accept or fix\n"
+    )
+
+
 def review_fix_prompt(task: str, review: str, changed_files: str) -> str:
     return (
-        "The self-review rejected the change. Fix the code so every acceptance "
-        "criterion is met and every conflict is resolved. Do not expand work "
-        "the task marks out of scope. If something is still ambiguous, list it "
-        "under Open questions instead of guessing.\n\n"
+        "The self-review rejected the change. Fix only the findings in the review. "
+        "Do not rewrite files that already work, and do not replace a passing "
+        "implementation with a new approach. Do not expand work the task marks out "
+        "of scope. If a cheat sheet is in the system prompt, follow it and do not "
+        "contradict it. If a finding is still ambiguous, list it under Open questions "
+        "instead of guessing.\n\n"
         f"Review:\n{review}\n\n"
         f"Changed files:\n{changed_files or '(none)'}\n\n"
         f"TASK:\n{task}"
