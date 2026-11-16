@@ -198,7 +198,9 @@ def _live_fixture(
             max_work_turns=16,
         )
         code, output = _run_checker(fixture.checker, project)
-        agent_ok = bool(result.tests_passed and result.review_passed and result.smoke_passed)
+        agent_ok = bool(
+            result.tests_passed and result.review_passed and result.smoke_passed and result.verify_passed
+        )
         if agent_ok and code == 0:
             status = "pass"
             detail = "agent passed and checker passed"
@@ -219,6 +221,7 @@ def _live_fixture(
                 "tests_passed": result.tests_passed,
                 "review_passed": result.review_passed,
                 "smoke_passed": result.smoke_passed,
+                "verify_passed": result.verify_passed,
             },
         )
     finally:

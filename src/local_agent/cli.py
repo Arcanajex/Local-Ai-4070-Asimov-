@@ -345,6 +345,7 @@ def _overnight(args: argparse.Namespace) -> int:
                 "commit": result.commit,
                 "tests_passed": result.tests_passed,
                 "smoke_passed": result.smoke_passed,
+                "verify_passed": result.verify_passed,
                 "review_passed": result.review_passed,
                 "iterations": result.iterations,
                 "attempts": result.attempts,
@@ -354,7 +355,7 @@ def _overnight(args: argparse.Namespace) -> int:
             }
         )
     )
-    return 0 if result.tests_passed and result.smoke_passed else 1
+    return 0 if result.tests_passed and result.smoke_passed and result.verify_passed else 1
 
 
 def _archive_overnight_task(args: argparse.Namespace, succeeded: bool) -> Path | None:

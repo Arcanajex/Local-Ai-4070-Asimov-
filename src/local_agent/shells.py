@@ -18,6 +18,7 @@ task whose test command is ``true`` never records a passing run.
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import shutil
 import sys
@@ -73,6 +74,44 @@ def command_fails() -> str:
     """A command that exits 1 in bash and in Windows PowerShell."""
 
     return "exit 1"
+
+
+_AND_AND = re.compile(r"\s*&&\s*")
+
+
+def split_shell_chain(command: str) -> list[str]:
+    """Split a `&&` chain into separate commands.
+
+    Windows PowerShell 5.1 has no `&&` operator. Each step is run on its
+    own, and a failing step skips the rest of that chain.
+    """
+
+    text = (command or "").strip()
+    if not text:
+        return []
+    return [part.strip() for part in _AND_AND.split(text) if part.strip()]
+
+
+def adapt_platform_command(command: str) -> str:
+    """Return one command the platform shell can execute.
+
+    On Windows, a quoted program path is a string expression until the call
+    operator is in front: ``& 'C:\\path\\python.exe' args``. A command that
+    already starts with ``&`` is left alone. Split `&&` before calling this.
+    """
+
+    text = (command or "").strip()
+    if not text or os.name != "nt" or text.startswith("&"):
+        return text
+    if text[0] in {"'", '"'}:
+        return f"& {text}"
+    return text
+
+
+def platform_shell_commands(command: str) -> list[str]:
+    """Commands to run, in order, on bash or Windows PowerShell 5.1."""
+
+    return [adapt_platform_command(part) for part in split_shell_chain(command)]
 
 
 def find_posix_shell() -> str | None:

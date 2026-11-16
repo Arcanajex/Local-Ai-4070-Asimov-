@@ -7,7 +7,10 @@ puts the harness results in the prompt and, when every open item is only a
 request to re-check a green result, treats the vote as a pass.
 
 A concrete defect still goes to review-fix. A claim that a file or symbol
-is missing is dropped when the tree contains it.
+is missing is dropped when the tree contains it. An acceptance line marked
+not met or unverified is a verify-only item when its only stated reason is
+that the harness did not run or execute the check. Any other not-met line,
+including an ambiguous one, still rejects.
 """
 
 from __future__ import annotations
@@ -227,6 +230,16 @@ _POSITIVE = re.compile(
 
 
 @dataclass
+class VerifyCommandResult:
+    """One acceptance command the harness ran before review."""
+
+    command: str
+    ok: bool
+    exit_code: int | None
+    output: str
+
+
+@dataclass
 class Finding:
     text: str
     section: str
@@ -328,6 +341,16 @@ def output_tail(text: str, *, lines: int = TAIL_LINES, chars: int = TAIL_CHARS) 
     return "…\n" + kept[-chars:]
 
 
+def split_verify_output(text: str) -> tuple[str, str]:
+    """Split a combined check log into the earlier part and the verify part."""
+
+    for marker in ("\n\nVerify check passed.\n", "\n\nVerify check failed:\n"):
+        if marker in (text or ""):
+            head, tail = text.rsplit(marker, 1)
+            return head, tail
+    return text or "", ""
+
+
 def split_smoke_output(text: str) -> tuple[str, str]:
     """Split the combined check log into the test part and the smoke part."""
 
@@ -366,16 +389,20 @@ def harness_checks_green(
     tests_passed: bool,
     smoke_passed: bool | None,
     must_missing: list[str],
+    verify_passed: bool | None = None,
 ) -> bool:
-    """True when build/test, must_exist, and smoke all passed.
+    """True when build/test, must_exist, smoke, and verify commands all passed.
 
     `smoke_passed is None` means the task has no smoke command, which is a
-    pass. A smoke failure is `False`.
+    pass. A smoke failure is `False`. `verify_passed is None` means the task
+    has no verify commands. A verify failure is `False`.
     """
 
     if not tests_passed:
         return False
     if smoke_passed is False:
+        return False
+    if verify_passed is False:
         return False
     return not must_missing
 
@@ -391,6 +418,7 @@ def build_harness_evidence(
     smoke_passed: bool | None,
     smoke_command: str | None,
     changed_files: list[str],
+    verify_results: list[VerifyCommandResult] | None = None,
 ) -> str:
     """The block pasted into the review prompt.
 
@@ -399,7 +427,8 @@ def build_harness_evidence(
     symbol is missing can be checked against the tree.
     """
 
-    test_part, smoke_part = split_smoke_output(test_output)
+    body, _verify_part = split_verify_output(test_output)
+    test_part, smoke_part = split_smoke_output(body)
     rows, _missing = must_exist_rows(project, must_exist, test_part)
     lines = [
         "HARNESS CHECKS (executed by the harness, not by you):",
@@ -434,6 +463,8 @@ def build_harness_evidence(
             lines.append(f"Smoke command: {smoke_command}")
         lines.append("Smoke output tail:")
         lines.append(output_tail(smoke_part))
+    lines.append("")
+    lines.extend(_verify_evidence_lines(verify_results))
     lines.extend(["", "Files changed since the task base:"])
     if not changed_files:
         lines.append("- (none)")
@@ -482,20 +513,180 @@ def extract_findings(text: str) -> list[Finding]:
     return found
 
 
+_STATUS_MARK = re.compile(r"(?i)\b(?:not met|unverified)\b")
+_UNRUN_REASON = re.compile(
+    r"(?i)(?:"
+    r"\bharness\b.{0,60}\b(?:did not|didn't|has not|have not|never|does not|doesn't)\b.{0,30}\b(?:run|ran|execute|executed)\b"
+    r"|"
+    r"\b(?:did not|didn't|has not|have not|was not|were not|wasn't|weren't|never)\s+(?:run|ran|execute|executed)\b"
+    r"|"
+    r"\bnot\s+(?:run|executed)\s+by\s+the\s+harness\b"
+    r"|"
+    r"\b(?:command|commands|check|checks|variant|variants)\b.{0,40}\b(?:was|were|is|are)\s+not\s+(?:run|executed)\b"
+    r"|"
+    r"\bnot\s+(?:been\s+)?(?:run|executed)\b"
+    r")"
+)
+_REASON_DEFECT = re.compile(
+    r"(?i)("
+    r"\[defect\]|"
+    r"\bwrong\b|\bincorrect\b|\bbug\b|\bbroken\b|"
+    r"\bfails?\b|\bfailed\b|\bfailing\b|"
+    r"\bcrash(?:es|ed|ing)?\b|\bexception\b|\bthrows?\b|"
+    r"\binstead\b|\bregression\b|"
+    r"\bmissing\b|\bnull\b|\berror\b|\btraceback\b|"
+    r"\bhangs?\b|\binfinite\b|"
+    r"\bnonzero\b|\bnon-zero\b|"
+    r"\bexit code\s*[1-9]"
+    r")"
+)
+_REASON_FILLER = {
+    "the",
+    "a",
+    "an",
+    "this",
+    "that",
+    "these",
+    "those",
+    "it",
+    "its",
+    "command",
+    "commands",
+    "check",
+    "checks",
+    "variant",
+    "variants",
+    "harness",
+    "only",
+    "because",
+    "so",
+    "and",
+    "or",
+    "to",
+    "of",
+    "for",
+    "by",
+    "was",
+    "were",
+    "is",
+    "are",
+    "not",
+    "run",
+    "ran",
+    "execute",
+    "executed",
+    "executing",
+    "did",
+    "does",
+    "do",
+    "two",
+    "both",
+    "all",
+    "them",
+    "they",
+    "with",
+    "on",
+    "in",
+    "from",
+    "has",
+    "have",
+    "been",
+    "be",
+    "never",
+    "actually",
+    "yet",
+    "which",
+    "when",
+    "after",
+    "before",
+    "during",
+    "their",
+    "there",
+    "also",
+    "just",
+    "still",
+}
+_BACKTICK_SPAN = re.compile(r"`([^`\n]+)`")
+_RUN_CUE = re.compile(r"(?i)\b(?:run|execute|executed|executing|exit code|exits?)\b")
+_KNOWN_RUNNER = re.compile(
+    r"(?i)^(?:python3?|py|pytest|dotnet|cargo|npm|npx|pnpm|yarn|node|go|pwsh|powershell|bash|sh|cmd|msbuild)(?:\.exe)?$"
+)
+_SHELL_BUILTIN = {"exit", "true", "false", "echo", "cd", "dir", "ls", "type", "cat"}
+_BAD_SHELL = re.compile(r"[|;<>]|\$\(")
+
+
+def acceptance_unrun_only(text: str) -> bool:
+    """True when a not-met or unverified line only says the check was not run.
+
+    The reason after the status marker has to say the harness, command, or
+    check was not run or not executed, and it must not also describe a defect.
+    An empty reason, a defect word, or any other leftover claim is ambiguous
+    and returns False so the line still rejects.
+    """
+
+    raw = _strip_bullet(text)
+    if not raw or _STATUS_MARK.search(raw) is None:
+        return False
+    match = None
+    for match in _STATUS_MARK.finditer(raw):
+        pass
+    if match is None:
+        return False
+    reason = _unwrap_reason(raw[match.end() :])
+    if not reason or _UNRUN_REASON.search(reason) is None:
+        return False
+    if _reason_has_defect(reason):
+        return False
+    return _reason_leftover(reason) == ""
+
+
+def extract_acceptance_commands(section: str) -> list[str]:
+    """Backtick commands from an Acceptance criteria section.
+
+    A span is kept only when it looks like a command to run. A flag fragment
+    such as `--frames 60`, a function call, or a bare filename is left out.
+    `&&` stays in the span; the runner splits it because PowerShell 5.1 has
+    no `&&`. Callers should treat this as opt-in: a guessed command is easy
+    to get wrong.
+    """
+
+    found: list[str] = []
+    seen: set[str] = set()
+    for line in (section or "").splitlines():
+        spans = _BACKTICK_SPAN.findall(line)
+        if not spans:
+            continue
+        cue = _RUN_CUE.search(line) is not None
+        for span in spans:
+            command = span.strip()
+            if not _reliable_command(command, cue):
+                continue
+            if command in seen:
+                continue
+            seen.add(command)
+            found.append(command)
+    return found
+
+
 def classify_finding(text: str, section: str) -> str | None:
     """`defect`, `verify-only`, or None when the line is not an open item.
 
     An explicit `[defect]` tag wins. A line that both asks to verify and
-    describes a concrete failure is a defect. Acceptance lines marked
-    `not met` are defects. Narration in Correctness or Tests is ignored.
-    Anything else left under Findings, Risks, or Open questions is a defect,
-    so a verify-only pass cannot hide an item the heuristic did not recognize.
+    describes a concrete failure is a defect. An acceptance line marked
+    `not met` or `unverified` is verify-only when its only reason is that
+    the harness did not run or execute the check. Any other acceptance line
+    that is not explicitly met is a defect. Narration in Correctness or Tests
+    is ignored. Anything else left under Findings, Risks, or Open questions
+    is a defect, so a verify-only pass cannot hide an item the heuristic did
+    not recognize.
     """
 
     if _is_blank_item(text):
         return None
     if section == "Acceptance criteria":
-        if re.search(r"(?i)\bnot met\b", text):
+        if acceptance_unrun_only(text):
+            return "verify-only"
+        if _STATUS_MARK.search(text):
             return "defect"
         if re.search(r"(?i)\bmet\b", text):
             return None
@@ -595,18 +786,36 @@ def decide_review(
 ) -> ReviewRuling:
     """Pass, fix, or pass-by-evidence for one well-formed review.
 
-    `not met`, a conflict, a coverage gap, and any other concrete defect
-    still fix. A `fix` vote (or reject / needs changes) whose remaining
-    items are all verify/run/check/confirm requests passes only when the
-    harness checks are green and the flag is on. A missing-file claim that
-    the tree contradicts is dropped and does not count as a defect.
+    A real `not met` line, a conflict, a coverage gap, and any other concrete
+    defect still fix. An acceptance line whose only reason is that the
+    harness did not run or execute the check is verify-only, including when
+    the verdict is `accept`. A `fix` or `accept` vote whose remaining items
+    are all verify/run/check/confirm requests passes only when the harness
+    checks are green and the flag is on. A missing-file claim that the tree
+    contradicts is dropped and does not count as a defect. An ambiguous
+    not-met or unverified line still rejects.
     """
 
     problems = review_problems(text, require_test_coverage=require_test_coverage)
+    status_lines = _acceptance_status_lines(text)
+    unrun_lines = [line for line in status_lines if acceptance_unrun_only(line)]
+    unrun_norm = {_norm_line(line) for line in unrun_lines}
+    problems = [problem for problem in problems if _norm_line(problem) not in unrun_norm]
+    seen_norms = {_norm_line(problem) for problem in problems}
+    for line in status_lines:
+        norm = _norm_line(line)
+        if norm in unrun_norm or norm in seen_norms:
+            continue
+        if re.search(r"(?i)\bunverified\b", line):
+            problems.append(line)
+            seen_norms.add(norm)
     contradicted: list[str] = []
     verify_items: list[str] = []
     defect_items: list[str] = []
     for finding in extract_findings(text):
+        if _norm_line(finding.text) in unrun_norm:
+            verify_items.append(finding.text)
+            continue
         if contradicted_by_tree(finding.text, project):
             contradicted.append(finding.text)
             continue
@@ -614,9 +823,12 @@ def decide_review(
             defect_items.append(finding.text)
         elif finding.kind == "verify-only":
             verify_items.append(finding.text)
+    for line in unrun_lines:
+        if not any(_norm_line(line) == _norm_line(item) for item in verify_items):
+            verify_items.append(line)
     contradicted = _dedupe(contradicted)
     verify_items = _dedupe(verify_items)
-    defect_items = _dedupe(defect_items)
+    defect_items = [item for item in _dedupe(defect_items) if _norm_line(item) not in unrun_norm]
     blocked = _blocking_problems(problems, contradicted)
     fix_vote = is_fix_verdict(text) or any(item == "verdict: fix" for item in problems)
 
@@ -627,6 +839,9 @@ def decide_review(
         return ReviewRuling("fix", reasons, verify_items, contradicted, _dedupe([*blocked, *defect_items]))
 
     if not fix_vote:
+        if unrun_lines and not (allow_verify_only_pass and checks_green):
+            listed = _dedupe(unrun_lines)
+            return ReviewRuling("fix", listed, verify_items, contradicted, listed)
         return ReviewRuling("pass", [], verify_items, contradicted, [])
 
     if defect_items:
@@ -666,6 +881,110 @@ def present_review(text: str, ruling: ReviewRuling) -> str:
     if not notes:
         return body
     return body.rstrip() + "\n\nHarness note:\n" + "\n\n".join(notes) + "\n"
+
+
+def _verify_evidence_lines(results: list[VerifyCommandResult] | None) -> list[str]:
+    if not results:
+        return ["Verify: not run (no verify commands)."]
+    lines = ["Verify commands (executed by the harness):"]
+    for item in results:
+        state = "passed" if item.ok else "failed"
+        code = "unknown" if item.exit_code is None else str(item.exit_code)
+        lines.append(f"- {item.command}: {state} (exit {code})")
+        lines.append("  output tail:")
+        for tail_line in output_tail(item.output).splitlines():
+            lines.append(f"  {tail_line}")
+    return lines
+
+
+def _acceptance_status_lines(text: str) -> list[str]:
+    body = extract_section(text or "", "Acceptance criteria")
+    lines: list[str] = []
+    for raw in body.splitlines():
+        line = _strip_bullet(raw)
+        if line and _STATUS_MARK.search(line):
+            lines.append(line)
+    return lines
+
+
+def _norm_line(text: str) -> str:
+    return re.sub(r"\s+", " ", _strip_bullet(text)).strip().lower()
+
+
+def _strip_bullet(text: str) -> str:
+    line = (text or "").strip()
+    line = re.sub(r"^[-*+]\s+", "", line)
+    line = re.sub(r"^\d+[.)]\s+", "", line)
+    return line.strip()
+
+
+def _unwrap_reason(reason: str) -> str:
+    text = reason.strip().strip(".:;—- ").strip()
+    if len(text) >= 2 and text[0] == "(" and text[-1] == ")":
+        depth = 0
+        wraps = True
+        for index, char in enumerate(text):
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0 and index != len(text) - 1:
+                    wraps = False
+                    break
+        if wraps and depth == 0:
+            text = text[1:-1].strip()
+    return text
+
+
+def _reason_has_defect(reason: str) -> bool:
+    scrubbed = _UNRUN_REASON.sub(" ", reason)
+    return _REASON_DEFECT.search(scrubbed) is not None
+
+
+def _reason_leftover(reason: str) -> str:
+    text = _UNRUN_REASON.sub(" ", reason)
+    text = re.sub(r"`[^`]*`", " ", text)
+    text = re.sub(r"--?[\w.-]+", " ", text)
+    text = re.sub(r"[^A-Za-z0-9\s]", " ", text)
+    words = [
+        word.lower()
+        for word in text.split()
+        if word.lower() not in _REASON_FILLER and not word.isdigit()
+    ]
+    return " ".join(words)
+
+
+def _reliable_command(command: str, cue: bool) -> bool:
+    if not command or len(command) > 400 or "\n" in command:
+        return False
+    if _BAD_SHELL.search(command):
+        return False
+    parts = [part.strip() for part in re.split(r"\s*&&\s*", command) if part.strip()]
+    if not parts:
+        return False
+    return all(_reliable_step(part, cue) for part in parts)
+
+
+def _reliable_step(part: str, cue: bool) -> bool:
+    if part.startswith("-") or "(" in part or ")" in part:
+        return False
+    if part[:1] in {"'", '"'}:
+        return cue or re.search(r"(?i)\.(?:exe|ps1|sh|bat|cmd)\b", part) is not None
+    tokens = part.split()
+    if not tokens or tokens[0].startswith("-"):
+        return False
+    first = tokens[0]
+    known = _KNOWN_RUNNER.match(first) is not None
+    script = (
+        first.startswith("./")
+        or first.startswith(".\\")
+        or first.startswith("../")
+        or re.search(r"(?i)\.(?:ps1|sh|bat|cmd|exe)$", first) is not None
+    )
+    has_args = len(tokens) >= 2
+    if (known or script) and (cue or has_args):
+        return True
+    return cue and first.lower() in _SHELL_BUILTIN
 
 
 def _blocking_problems(problems: list[str], contradicted: list[str]) -> list[str]:

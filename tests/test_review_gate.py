@@ -11,13 +11,16 @@ from local_agent.config import get_profile, write_override
 from local_agent.overnight import (
     apply_project_defaults,
     parse_task,
+    resolve_verify_commands,
     review_verify_only_enabled,
     run_overnight,
 )
 from local_agent.review_gate import (
+    acceptance_unrun_only,
     build_harness_evidence,
     contradicted_by_tree,
     decide_review,
+    extract_acceptance_commands,
     parse_test_counts,
 )
 from local_agent.shells import command_fails, command_succeeds, python_shell
@@ -143,6 +146,172 @@ def test_decide_review_verify_only_mixed_and_contradicted(tmp_path):
         allow_verify_only_pass=True,
     )
     assert not_met.action == "fix"
+
+
+TASK07_REVIEW = (
+    "Acceptance criteria:\n"
+    "- Run `--frames 60` and `--frames 60 --ps1` with exit code 0: "
+    "not met (harness did not run these two variants)\n"
+    "Out-of-scope files touched:\nnone\n"
+    "Conflicts with AGENTS.md or decisions:\nnone\n"
+    "Findings:\n"
+    "- [verify-only] confirm the frames variants were executed\n"
+    "Verdict: accept\n"
+)
+
+DEFECT_NOT_MET = (
+    "Acceptance criteria:\n"
+    "- the window stays open: not met (it crashes on startup)\n"
+    "Out-of-scope files touched:\nnone\n"
+    "Conflicts with AGENTS.md or decisions:\nnone\n"
+    "Verdict: accept\n"
+)
+
+
+def test_harness_did_not_run_is_verify_only_and_a_real_defect_still_rejects(tmp_path):
+    project = tmp_path / "repo"
+    project.mkdir()
+    line = (
+        "- Run `--frames 60` and `--frames 60 --ps1` with exit code 0: "
+        "not met (harness did not run these two variants)"
+    )
+    assert acceptance_unrun_only(line)
+    assert acceptance_unrun_only("cmd: unverified (the command was not executed by the harness)")
+    assert not acceptance_unrun_only("need to verify the window: not met")
+    assert not acceptance_unrun_only("the window stays open: not met (it crashes on startup)")
+    assert not acceptance_unrun_only("cmd: not met (harness did not run it and the output is wrong)")
+    assert not acceptance_unrun_only("cmd: unverified")
+
+    passed = decide_review(TASK07_REVIEW, project, checks_green=True, allow_verify_only_pass=True)
+    assert passed.action == "pass"
+    assert passed.problems == []
+    assert any("harness did not run" in item for item in passed.verify_items)
+    assert any("frames" in item for item in passed.verify_items)
+    assert passed.defects == []
+
+    red = decide_review(TASK07_REVIEW, project, checks_green=False, allow_verify_only_pass=True)
+    assert red.action == "fix"
+    assert any("harness did not run" in item for item in red.problems)
+
+    disabled = decide_review(TASK07_REVIEW, project, checks_green=True, allow_verify_only_pass=False)
+    assert disabled.action == "fix"
+
+    defect = decide_review(DEFECT_NOT_MET, project, checks_green=True, allow_verify_only_pass=True)
+    assert defect.action == "fix"
+    assert any("crashes" in item for item in defect.problems)
+
+
+def test_task07_accept_with_only_unrun_items_passes(tmp_path):
+    project = _repo(tmp_path / "repo")
+    result = _run(
+        tmp_path,
+        project,
+        f"---\ntest_command: {command_succeeds()}\n---\n" + _body("frames"),
+        TASK07_REVIEW,
+        [],
+    )
+    assert result.status == "passed", result.review
+    assert result.review_passed is True
+    phases = [_phase(line) for line in _events(tmp_path)]
+    assert "review-fix" not in phases
+    event = _kind(tmp_path, "review_verify_only_pass")
+    blob = " ".join(event["items"])
+    assert "harness did not run" in blob
+    assert "--frames 60" in blob
+    assert _kinds(tmp_path).count("review_rejected") == 0
+
+
+def test_real_not_met_defect_still_rejects(tmp_path):
+    project = _repo(tmp_path / "repo")
+    result = _run(
+        tmp_path,
+        project,
+        f"---\ntest_command: {command_succeeds()}\n---\n" + _body("window"),
+        DEFECT_NOT_MET,
+        [],
+    )
+    assert "review-fix" in [_phase(line) for line in _events(tmp_path)]
+    assert result.status != "passed"
+    assert result.review_passed is False
+    rejected = _kind(tmp_path, "review_rejected")
+    assert any("crashes" in item for item in rejected["problems"])
+    assert _kinds(tmp_path).count("review_verify_only_pass") == 0
+
+
+def test_verify_commands_are_run_and_shown_to_the_reviewer(tmp_path):
+    project = _repo(tmp_path / "repo")
+    seen: list[str] = []
+    command = python_shell("-c", "print('verify-ok')")
+    result = _run(
+        tmp_path,
+        project,
+        "---\n"
+        f"test_command: {command_succeeds()}\n"
+        "verify_commands:\n"
+        f"  - {command}\n"
+        "---\n" + _body("verify"),
+        _accept_review(),
+        seen,
+    )
+    assert result.status == "passed", result.review
+    assert result.verify_passed is True
+    assert result.verify_ran is True
+    prompt = _review_prompt(seen)
+    assert "Verify commands" in prompt
+    assert "verify-ok" in prompt
+    assert "passed (exit 0)" in prompt
+    assert command in prompt
+    event = _kind(tmp_path, "verify")
+    assert event["passed"] is True
+
+
+def test_failing_verify_command_starts_a_fix_round(tmp_path):
+    project = _repo(tmp_path / "repo")
+    seen: list[str] = []
+    result = _run(
+        tmp_path,
+        project,
+        f"---\ntest_command: {command_succeeds()}\nverify_commands:\n  - {command_fails()}\n---\n" + _body("verify"),
+        _accept_review(),
+        seen,
+        max_iterations=2,
+    )
+    assert result.verify_passed is False
+    assert result.status != "passed"
+    assert "fix-1" in [_phase(line) for line in _events(tmp_path)]
+    assert any("verify command failed" in prompt for prompt in seen)
+    assert _kinds(tmp_path).count("review_verify_only_pass") == 0
+
+
+def test_extract_verify_commands_is_opt_in_and_skips_flag_fragments(tmp_path):
+    section = (
+        "- [ ] Run `exit 0` with exit code 0\n"
+        "- [ ] Run `--frames 60` and `--frames 60 --ps1` with exit code 0\n"
+        "- [ ] `widget()` returns the status\n"
+        "- [ ] `python app.py --frames 60` passes\n"
+    )
+    extracted = extract_acceptance_commands(section)
+    assert "exit 0" in extracted
+    assert "python app.py --frames 60" in extracted
+    assert all(not item.startswith("--") for item in extracted)
+    assert not any("widget" in item for item in extracted)
+
+    project = tmp_path / "repo"
+    project.mkdir()
+    (project / "AGENTS.md").write_text("---\nextract_verify_commands: true\n---\n# Agents\n", encoding="utf-8")
+    task = parse_task(
+        "# Frames\n\n## Goal\n\nRun.\n\n## Acceptance criteria\n\n"
+        "- [ ] Run `exit 0` with exit code 0\n\n## Out of scope\n\n- none\n"
+    )
+    apply_project_defaults(task, project)
+    profile = get_profile("day")
+    assert resolve_verify_commands(task, profile) == ["exit 0"]
+
+    off = parse_task(
+        "# Frames\n\n## Goal\n\nRun.\n\n## Acceptance criteria\n\n"
+        "- [ ] Run `exit 0` with exit code 0\n\n## Out of scope\n\n- none\n"
+    )
+    assert resolve_verify_commands(off, profile) == []
 
 
 def test_review_verify_only_pass_resolution(tmp_path):
@@ -271,6 +440,15 @@ def test_task_can_disable_verify_only_pass(tmp_path):
     assert result.review_passed is False
     assert result.status != "passed"
     assert _kinds(tmp_path).count("review_verify_only_pass") == 0
+
+
+def _accept_review() -> str:
+    return (
+        "Acceptance criteria:\n- it works: met\n"
+        "Out-of-scope files touched:\nnone\n"
+        "Conflicts with AGENTS.md or decisions:\nnone\n"
+        "Verdict: accept\n"
+    )
 
 
 def _wrapped(middle: str) -> str:
