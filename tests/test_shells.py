@@ -18,6 +18,7 @@ from local_agent.shells import (
     command_succeeds,
     find_posix_shell,
     format_shell_command,
+    platform_shell_commands,
     python_shell,
 )
 from local_agent.smoke_gate import run_smoke
@@ -58,6 +59,21 @@ def test_powershell_quotes_a_path_with_the_call_operator(monkeypatch):
     quoted = shells.format_shell_command(["git", "commit", "-m", "add feature"])
     assert quoted.startswith("& ")
     assert "'add feature'" in quoted
+
+
+def test_verify_commands_split_and_and_and_quote_a_windows_path(monkeypatch):
+    import local_agent.shells as shells
+
+    assert shells.split_shell_chain("exit 0 && exit 1") == ["exit 0", "exit 1"]
+    assert "&&" not in " ".join(platform_shell_commands("python app.py && python app.py --ps1"))
+    monkeypatch.setattr(shells.os, "name", "nt")
+    quoted = '"C:\\Program Files\\app.exe" --frames 60'
+    adapted = shells.platform_shell_commands(quoted)
+    assert adapted == ["& \"C:\\Program Files\\app.exe\" --frames 60"]
+    already = shells.adapt_platform_command("& 'C:\\Program Files\\app.exe' --frames 60")
+    assert already.startswith("& ")
+    monkeypatch.setattr(shells.os, "name", "posix")
+    assert shells.adapt_platform_command(quoted) == quoted
 
 
 def test_bash_quotes_without_a_call_operator(monkeypatch):

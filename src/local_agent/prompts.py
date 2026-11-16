@@ -68,6 +68,7 @@ def fix_prompt(
     changed_files: str,
     *,
     smoke_failed: bool = False,
+    verify_failed: bool = False,
     diff_text: str = "",
     traceback_files: str = "",
     false_pass_reason: str = "",
@@ -85,6 +86,11 @@ def fix_prompt(
         lead = (
             "The smoke check failed after the tests passed. Fix the code so the real "
             "entry point runs. Do not mock the unit under test."
+        )
+    elif verify_failed:
+        lead = (
+            "A verify command failed after the tests passed. "
+            "The acceptance command must exit 0. Fix the code so that command succeeds."
         )
     else:
         lead = "The tests failed. Fix the code."

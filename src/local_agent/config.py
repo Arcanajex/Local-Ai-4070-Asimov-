@@ -48,6 +48,7 @@ OVERRIDABLE = {
     "extra_probe_patterns",
     "extra_scratch_markers",
     "review_verify_only_pass",
+    "extract_verify_commands",
 }
 
 
@@ -117,6 +118,9 @@ class Profile:
     # overrides this. The default stays on so an existing profile does not
     # have to set it.
     review_verify_only_pass: bool = True
+    # Backtick commands in Acceptance criteria are not run unless this is
+    # set. A guessed command is riskier than an explicit verify_commands list.
+    extract_verify_commands: bool = False
 
     @property
     def offload_flag(self) -> str:
@@ -271,6 +275,7 @@ def profile_from_dict(name: str, data: dict[str, Any], defaults: dict[str, Any])
         extra_probe_patterns=_as_str_list(merged.get("extra_probe_patterns")),
         extra_scratch_markers=_as_str_list(merged.get("extra_scratch_markers")),
         review_verify_only_pass=_as_bool(merged.get("review_verify_only_pass", True)),
+        extract_verify_commands=_as_bool(merged.get("extract_verify_commands", False)),
     )
 
 

@@ -59,8 +59,10 @@ from local_agent.prompts import (
     test_first_repair_prompt,
 )
 from local_agent.review_gate import (
+    VerifyCommandResult,
     build_harness_evidence,
     decide_review,
+    extract_acceptance_commands,
     harness_checks_green,
     is_fix_verdict,
     must_exist_rows,
@@ -83,6 +85,7 @@ from local_agent.test_first import (
     restore_rels,
     snapshot_tree,
 )
+from local_agent.shells import platform_shell_commands
 from local_agent.tools import Workspace, clear_bytecode, run_command
 from local_agent.traceback_files import format_traceback_files
 
@@ -103,7 +106,16 @@ RETRYABLE_STATUSES = {
     "review_fix_reverted",
     "restored_snapshot",
 }
-_LIST_KEYS = {"context", "must_exist", "blocked_probes", "api_error_patterns", "scratch_dirs"}
+_LIST_KEYS = {
+    "context",
+    "must_exist",
+    "blocked_probes",
+    "api_error_patterns",
+    "scratch_dirs",
+    "verify_commands",
+}
+_VERIFY_TIMEOUT_DEFAULT = 120
+_VERIFY_TIMEOUT_MAX = 600
 _FRONT_MATTER_ERROR = (
     "front matter could not be parsed: the file starts with --- but there is no closing ---. "
     "A UTF-8 BOM is stripped before parsing; the closing line must be exactly ---."
@@ -138,6 +150,11 @@ class TaskSpec:
     # None means the task did not set it. The profile default (true) applies,
     # unless AGENTS.md front matter sets the key.
     review_verify_only_pass: bool | None = None
+    verify_commands: list[str] = field(default_factory=list)
+    verify_timeout: int = _VERIFY_TIMEOUT_DEFAULT
+    # None means unset. Extraction stays off unless the task, AGENTS.md, or
+    # the profile opts in. An explicit verify_commands list does not need it.
+    extract_verify_commands: bool | None = None
     front_matter_error: str | None = None
 
 
@@ -153,6 +170,8 @@ class OvernightResult:
     review_passed: bool = True
     smoke_passed: bool = True
     smoke_ran: bool = False
+    verify_passed: bool = True
+    verify_ran: bool = False
     attempts: int = 1
     attempt_history: list[dict[str, Any]] = field(default_factory=list)
     stop_requested: bool = False
@@ -199,6 +218,9 @@ def parse_task(text: str, path: Path | None = None) -> TaskSpec:
         api_error_patterns=lists.get("api_error_patterns", []),
         scratch_dirs=lists.get("scratch_dirs", []),
         review_verify_only_pass=_optional_bool(meta, "review_verify_only_pass"),
+        verify_commands=lists.get("verify_commands", []),
+        verify_timeout=_clamp_verify_timeout(_meta_int(meta.get("verify_timeout"), _VERIFY_TIMEOUT_DEFAULT)),
+        extract_verify_commands=_optional_bool(meta, "extract_verify_commands"),
         front_matter_error=error,
     )
 
@@ -326,19 +348,25 @@ def review_verify_only_enabled(task: TaskSpec, profile: Profile) -> bool:
     return bool(getattr(profile, "review_verify_only_pass", True))
 
 
-def agents_front_matter(project: Path) -> dict[str, str]:
-    """Front matter of the target repo's AGENTS.md, or {} when it has none."""
-
+def _read_agents_front(project: Path) -> tuple[dict[str, str], dict[str, list[str]]]:
+    empty_lists = {key: [] for key in _LIST_KEYS}
     path = Path(project) / "AGENTS.md"
     if not path.is_file():
-        return {}
+        return {}, empty_lists
     try:
         text = path.read_text(encoding="utf-8")
     except OSError:
-        return {}
-    meta, _lists, _body, error = _split_front_matter(text)
+        return {}, empty_lists
+    meta, lists, _body, error = _split_front_matter(text)
     if error:
-        return {}
+        return {}, empty_lists
+    return meta, lists
+
+
+def agents_front_matter(project: Path) -> dict[str, str]:
+    """Front matter of the target repo's AGENTS.md, or {} when it has none."""
+
+    meta, _lists = _read_agents_front(project)
     return meta
 
 
@@ -348,7 +376,7 @@ def apply_project_defaults(task: TaskSpec, project: Path) -> TaskSpec:
     A key present on the task, even with an empty value, wins over AGENTS.md.
     """
 
-    meta = agents_front_matter(project)
+    meta, lists = _read_agents_front(project)
     if "smoke_command" not in task.explicit_keys and meta.get("smoke_command"):
         task.smoke_command = meta["smoke_command"]
     if "smoke_mode" not in task.explicit_keys and meta.get("smoke_mode"):
@@ -375,7 +403,46 @@ def apply_project_defaults(task: TaskSpec, project: Path) -> TaskSpec:
         task.cheat_sheet_marker = meta["cheat_sheet_marker"]
     if task.review_verify_only_pass is None and "review_verify_only_pass" in meta:
         task.review_verify_only_pass = _optional_bool(meta, "review_verify_only_pass")
+    if not task.verify_commands:
+        task.verify_commands = list(lists.get("verify_commands") or [])
+    if "verify_timeout" not in task.explicit_keys and meta.get("verify_timeout"):
+        task.verify_timeout = _clamp_verify_timeout(_meta_int(meta.get("verify_timeout"), task.verify_timeout))
+    if task.extract_verify_commands is None and "extract_verify_commands" in meta:
+        task.extract_verify_commands = _optional_bool(meta, "extract_verify_commands")
     return task
+
+
+def extract_verify_commands_enabled(task: TaskSpec, profile: Profile) -> bool:
+    """Task front matter, then AGENTS.md, then the profile. Default false.
+
+    `apply_project_defaults` copies the AGENTS.md value onto the task when
+    the task left the key unset.
+    """
+
+    if task.extract_verify_commands is not None:
+        return bool(task.extract_verify_commands)
+    return bool(getattr(profile, "extract_verify_commands", False))
+
+
+def resolve_verify_commands(task: TaskSpec, profile: Profile) -> list[str]:
+    """Explicit verify_commands, plus extracted acceptance commands when opted in."""
+
+    commands = [item.strip() for item in task.verify_commands if str(item).strip()]
+    if extract_verify_commands_enabled(task, profile):
+        commands.extend(extract_acceptance_commands(extract_section(task.body, "Acceptance criteria")))
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for command in commands:
+        key = command.strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(key)
+    return deduped
+
+
+def _clamp_verify_timeout(value: int) -> int:
+    return max(1, min(int(value), _VERIFY_TIMEOUT_MAX))
 
 
 def _title(body: str) -> str:
@@ -426,6 +493,9 @@ def run_overnight(
     review_passed = True
     smoke_passed = True
     smoke_ran = False
+    verify_passed = True
+    verify_ran = False
+    verify_results: list[VerifyCommandResult] = []
     context_block = ""
     plan_text = ""
     review_text = ""
@@ -436,6 +506,7 @@ def run_overnight(
     restore_note = {"ref": ""}
     try:
         apply_project_defaults(task, project)
+        task.verify_commands = resolve_verify_commands(task, profile)
         max_plan_turns = resolve_turn_budget(
             max_plan_turns, DEFAULT_PLAN_TURNS, task.plan_turns, profile.plan_turns
         )
@@ -595,6 +666,12 @@ def run_overnight(
             _record_snapshot(project, branch, snapshots, logger)
             stop_status = "passed"
 
+        def note_checks(outcome: tuple[str, bool, bool, bool, bool, list[VerifyCommandResult]]) -> None:
+            nonlocal test_output, tests_passed, smoke_passed, smoke_ran, verify_passed, verify_ran, verify_results
+            test_output, tests_passed, smoke_passed, ran_smoke, verify_passed, verify_results = outcome
+            smoke_ran = smoke_ran or ran_smoke
+            verify_ran = verify_ran or bool(verify_results)
+
         def note_fix_edits(before: dict[str, bytes]) -> bool:
             nonlocal fix_produced_changes, consecutive_noop_fixes
             changed = bool(changed_rels(before, snapshot_tree(project)))
@@ -607,11 +684,8 @@ def run_overnight(
             if time.monotonic() >= deadline:
                 stop_status = "time_budget"
                 break
-            test_output, tests_passed, smoke_passed, ran_smoke = _run_iteration_checks(
-                project, test_cmd, lint_cmd, task, logger, iterations
-            )
-            smoke_ran = smoke_ran or ran_smoke
-            if tests_passed and smoke_passed:
+            note_checks(_run_iteration_checks(project, test_cmd, lint_cmd, task, logger, iterations))
+            if tests_passed and smoke_passed and verify_passed:
                 gap_reason = cumulative_gap()
                 release = false_pass_release(
                     gap_reason,
@@ -702,6 +776,7 @@ def run_overnight(
                         project,
                         test_output,
                         smoke_failed=tests_passed and not smoke_passed,
+                        verify_failed=tests_passed and smoke_passed and not verify_passed,
                         cheat_sheet=cheat_sheet,
                         api_patterns=api_patterns,
                         base=base_sha,
@@ -719,17 +794,14 @@ def run_overnight(
                 stop_status = fix.status
                 # Still run the checks once more if the model managed to edit before stopping.
                 if fix.status != "time_budget":
-                    test_output, tests_passed, smoke_passed, ran_smoke = _run_iteration_checks(
-                        project, test_cmd, lint_cmd, task, logger, iterations
-                    )
-                    smoke_ran = smoke_ran or ran_smoke
+                    note_checks(_run_iteration_checks(project, test_cmd, lint_cmd, task, logger, iterations))
                     release = false_pass_release(
                         cumulative_gap(),
                         fix_produced_changes=fix_produced_changes,
                         consecutive_noop_fixes=consecutive_noop_fixes,
                         implement_status=implement.status,
                     )
-                    if tests_passed and smoke_passed and release:
+                    if tests_passed and smoke_passed and verify_passed and release:
                         reason, accept_gap = release
                         release_guard(reason, accept_gap=accept_gap)
                 break
@@ -739,7 +811,17 @@ def run_overnight(
         review_text = ""
         review_passed = False
         if time.monotonic() < deadline:
-            review_text, review_passed, tests_passed, smoke_passed, smoke_ran, test_output, stop_status = (
+            (
+                review_text,
+                review_passed,
+                tests_passed,
+                smoke_passed,
+                smoke_ran,
+                test_output,
+                stop_status,
+                verify_passed,
+                verify_results,
+            ) = (
                 _review_and_maybe_fix(
                     client=client,
                     workspace=workspace,
@@ -762,18 +844,17 @@ def run_overnight(
                     branch=branch,
                     restore_note=restore_note,
                     base=base_sha,
+                    verify_results=verify_results,
+                    verify_passed=verify_passed,
                 )
             )
         if restore_note["ref"] and not restored_snapshot:
             restored_snapshot = restore_note["ref"]
-        if snapshots and not (tests_passed and smoke_passed):
+        if snapshots and not (tests_passed and smoke_passed and verify_passed):
             restored = _restore_last_snapshot(project, snapshots[-1], logger)
             if restored:
                 restored_snapshot = restored
-                test_output, tests_passed, smoke_passed, ran_smoke = _run_iteration_checks(
-                    project, test_cmd, lint_cmd, task, logger, "restore"
-                )
-                smoke_ran = smoke_ran or ran_smoke
+                note_checks(_run_iteration_checks(project, test_cmd, lint_cmd, task, logger, "restore"))
                 review_text = (
                     (review_text or "").rstrip()
                     + f"\n\nRestored the last passing snapshot {restored} because the run ended worse "
@@ -786,7 +867,7 @@ def run_overnight(
             "review_fix_reverted",
             "restored_snapshot",
         }
-        if tests_passed and smoke_passed and review_passed and stop_status not in kept_failure:
+        if tests_passed and smoke_passed and verify_passed and review_passed and stop_status not in kept_failure:
             # Re-check the cumulative diff. Review-fix can undo a tree that
             # looked real. A gap the guard already released on purpose (a fix
             # round that changed files, or two no-op rounds) stays released.
@@ -798,7 +879,7 @@ def run_overnight(
                 report_status = "passed"
         elif stop_status in kept_failure:
             report_status = stop_status
-        elif not tests_passed or not smoke_passed:
+        elif not tests_passed or not smoke_passed or not verify_passed:
             report_status = stop_status
         else:
             report_status = "review_failed"
@@ -815,6 +896,8 @@ def run_overnight(
             open_questions=_open_questions(plan_text, review_text),
             smoke_passed=smoke_passed,
             smoke_ran=smoke_ran,
+            verify_passed=verify_passed,
+            verify_ran=verify_ran,
             test_output_full=test_output,
             review_full=review_text,
             attempt=branch_attempt,
@@ -866,7 +949,9 @@ def _review_and_maybe_fix(
     branch: str,
     restore_note: dict[str, str] | None = None,
     base: str = "",
-) -> tuple[str, bool, bool, bool, bool, str, str]:
+    verify_results: list[VerifyCommandResult] | None = None,
+    verify_passed: bool = True,
+) -> tuple[str, bool, bool, bool, bool, str, str, bool, list[VerifyCommandResult]]:
     """Review once. Only a well-formed review can reject the change.
 
     A leaked tool call or a missing section is re-prompted and, if it stays
@@ -874,6 +959,29 @@ def _review_and_maybe_fix(
     that is limited to the findings. If that fix breaks a passing tree, the
     last passing snapshot is restored.
     """
+
+    verify_results = list(verify_results or [])
+
+    def pack(
+        review_text: str,
+        review_passed: bool,
+        tests_ok: bool,
+        smoke_ok: bool,
+        smoke_did_run: bool,
+        output: str,
+        status: str,
+    ) -> tuple[str, bool, bool, bool, bool, str, str, bool, list[VerifyCommandResult]]:
+        return (
+            review_text,
+            review_passed,
+            tests_ok,
+            smoke_ok,
+            smoke_did_run,
+            output,
+            status,
+            verify_passed,
+            verify_results,
+        )
 
     review_text, problems, malformed = _one_review(
         client,
@@ -891,6 +999,8 @@ def _review_and_maybe_fix(
         test_output=test_output,
         test_command=test_command,
         lint_command=lint_command,
+        verify_results=verify_results,
+        verify_passed=verify_passed,
     )
     if malformed:
         logger.event("review_unusable", summary="malformed review was not sent to review-fix")
@@ -899,13 +1009,13 @@ def _review_and_maybe_fix(
             + "\n\nThe review was not usable (tool-call markup or a missing required section) "
             "and was not sent to review-fix.\n"
         )
-        return note, False, tests_passed, smoke_passed, smoke_ran, test_output, "review_malformed"
+        return pack(note, False, tests_passed, smoke_passed, smoke_ran, test_output, "review_malformed")
     if not problems:
-        return review_text, True, tests_passed, smoke_passed, smoke_ran, test_output, stop_status
+        return pack(review_text, True, tests_passed, smoke_passed, smoke_ran, test_output, stop_status)
     logger.event("review_rejected", summary="; ".join(problems)[:500], problems=problems)
     if time.monotonic() >= deadline:
-        return review_text, False, tests_passed, smoke_passed, smoke_ran, test_output, stop_status
-    passing_before = tests_passed and smoke_passed
+        return pack(review_text, False, tests_passed, smoke_passed, smoke_ran, test_output, stop_status)
+    passing_before = tests_passed and smoke_passed and verify_passed
     _run_phase(
         client, workspace, logger, profile,
         with_project_context(
@@ -918,14 +1028,14 @@ def _review_and_maybe_fix(
         phase="review-fix",
         guard=work_guard,
     )
-    test_output, tests_passed, smoke_passed, ran_smoke = _run_iteration_checks(
+    test_output, tests_passed, smoke_passed, ran_smoke, verify_passed, verify_results = _run_iteration_checks(
         workspace.root, test_command, lint_command, task, logger, "review-fix"
     )
     smoke_ran = smoke_ran or ran_smoke
-    if passing_before and snapshots and (not tests_passed or not smoke_passed):
+    if passing_before and snapshots and not (tests_passed and smoke_passed and verify_passed):
         restored = _restore_last_snapshot(project=workspace.root, snapshot=snapshots[-1], logger=logger)
         if restored:
-            test_output, tests_passed, smoke_passed, ran_smoke = _run_iteration_checks(
+            test_output, tests_passed, smoke_passed, ran_smoke, verify_passed, verify_results = _run_iteration_checks(
                 workspace.root, test_command, lint_command, task, logger, "review-fix-revert"
             )
             smoke_ran = smoke_ran or ran_smoke
@@ -936,12 +1046,12 @@ def _review_and_maybe_fix(
                 + "\n\nreview-fix turned a passing build or test run into a failing one. "
                 f"The tree was restored to {restored}. The snapshot ref was kept.\n"
             )
-            return note, False, tests_passed, smoke_passed, smoke_ran, test_output, "review_fix_reverted"
-    if not tests_passed or not smoke_passed:
-        return review_text, False, tests_passed, smoke_passed, smoke_ran, test_output, "tests_failed"
+            return pack(note, False, tests_passed, smoke_passed, smoke_ran, test_output, "review_fix_reverted")
+    if not tests_passed or not smoke_passed or not verify_passed:
+        return pack(review_text, False, tests_passed, smoke_passed, smoke_ran, test_output, "tests_failed")
     _record_snapshot(workspace.root, branch, snapshots, logger)
     if time.monotonic() >= deadline:
-        return review_text, False, tests_passed, smoke_passed, smoke_ran, test_output, stop_status
+        return pack(review_text, False, tests_passed, smoke_passed, smoke_ran, test_output, stop_status)
     review_text, problems, malformed = _one_review(
         client,
         workspace,
@@ -958,6 +1068,8 @@ def _review_and_maybe_fix(
         test_output=test_output,
         test_command=test_command,
         lint_command=lint_command,
+        verify_results=verify_results,
+        verify_passed=verify_passed,
     )
     if malformed:
         logger.event("review_unusable", summary="second review was malformed and was not sent to another fix")
@@ -965,8 +1077,8 @@ def _review_and_maybe_fix(
             review_text.rstrip()
             + "\n\nThe second review was not usable and was not sent to another review-fix.\n"
         )
-        return note, False, tests_passed, smoke_passed, smoke_ran, test_output, "review_malformed"
-    return review_text, not problems, tests_passed, smoke_passed, smoke_ran, test_output, stop_status
+        return pack(note, False, tests_passed, smoke_passed, smoke_ran, test_output, "review_malformed")
+    return pack(review_text, not problems, tests_passed, smoke_passed, smoke_ran, test_output, stop_status)
 
 
 def _one_review(
@@ -986,12 +1098,14 @@ def _one_review(
     test_output: str = "",
     test_command: str = "",
     lint_command: str | None = None,
+    verify_results: list[VerifyCommandResult] | None = None,
+    verify_passed: bool | None = None,
 ) -> tuple[str, list[str], bool]:
     """Returns review text, substantive problems, and whether the reply is unusable.
 
     Up to two re-prompts. A still-malformed reply is not a rejection.
-    A fix vote that only asks to re-check a green harness result is not a
-    rejection either, when review_verify_only_pass is on.
+    An accept or fix vote whose open items only ask to re-check a green
+    harness result is not a rejection either, when review_verify_only_pass is on.
     """
 
     require_coverage = bool(test_first_files.strip())
@@ -1008,6 +1122,7 @@ def _one_review(
         smoke_passed=smoke_passed,
         smoke_command=task.smoke_command,
         changed_files=changed_files_since(workspace.root, base),
+        verify_results=verify_results,
     )
     for attempt in range(3):
         prompt = review_prompt(
@@ -1045,6 +1160,7 @@ def _one_review(
                 must_exist=task.must_exist,
                 allow_verify_only_pass=review_verify_only_enabled(task, profile),
                 require_test_coverage=require_coverage,
+                verify_passed=verify_passed,
             )
             if smoke_passed is False and "smoke" not in text.lower():
                 text = text + "\n\nSmoke: the smoke command did not pass.\n"
@@ -1074,14 +1190,16 @@ def _apply_review_policy(
     must_exist: list[str],
     allow_verify_only_pass: bool,
     require_test_coverage: bool,
+    verify_passed: bool | None = None,
 ) -> tuple[str, list[str]]:
-    """Turn a verify-only fix vote into a pass, and drop contradicted findings."""
+    """Turn a verify-only accept or fix vote into a pass, and drop contradicted findings."""
 
     _rows, must_missing = must_exist_rows(project, must_exist, test_output)
     green = harness_checks_green(
         tests_passed=tests_passed,
         smoke_passed=smoke_passed,
         must_missing=must_missing,
+        verify_passed=verify_passed,
     )
     ruling = decide_review(
         text,
@@ -1098,13 +1216,15 @@ def _apply_review_policy(
             summary="dropped findings contradicted by the tree: "
             + "; ".join(ruling.contradicted)[:300],
         )
-    if ruling.action == "pass" and ruling.verify_items and is_fix_verdict(text):
+    accept_or_fix = is_fix_verdict(text) or re.search(r"(?im)^[ \t>*-]*verdict\s*:\s*accept\b", text or "")
+    if ruling.action == "pass" and ruling.verify_items and allow_verify_only_pass and green and accept_or_fix:
         logger.event(
             "review_verify_only_pass",
             phase=phase,
             items=ruling.verify_items,
             tests_passed=tests_passed,
             smoke_passed=smoke_passed,
+            verify_passed=verify_passed,
             must_exist_missing=must_missing,
             summary="verify-only review treated as pass: " + "; ".join(ruling.verify_items)[:300],
         )
@@ -1197,12 +1317,13 @@ def _run_iteration_checks(
     task: TaskSpec,
     logger: RunLogger,
     iteration: Any,
-) -> tuple[str, bool, bool, bool]:
-    """Run tests, then the smoke command when the tests passed.
+) -> tuple[str, bool, bool, bool, bool, list[VerifyCommandResult]]:
+    """Run tests, then smoke, then verify commands when the earlier checks passed.
 
-    Returns output, tests_passed, smoke_passed, smoke_ran. smoke_passed stays
-    true when the task has no smoke command. A smoke failure does not flip
-    tests_passed; the caller treats either failure as a failed iteration.
+    Returns output, tests_passed, smoke_passed, smoke_ran, verify_passed,
+    verify_results. smoke_passed and verify_passed stay true when that check
+    is not configured. A smoke or verify failure does not flip tests_passed;
+    the caller treats either failure as a failed iteration.
     """
 
     output, tests_ok = _run_checks(project, test_command, lint_command)
@@ -1229,28 +1350,81 @@ def _run_iteration_checks(
         output=output,
         summary=f"iteration {iteration} passed={tests_ok}",
     )
-    if not tests_ok or not task.smoke_command:
-        return output, tests_ok, True, False
-    smoke = run_smoke(
-        task.smoke_command,
-        cwd=project,
-        mode=task.smoke_mode,
-        timeout=task.smoke_timeout,
-        launch_seconds=task.smoke_launch_seconds,
-        fail_on_traceback=task.smoke_fail_on_traceback,
-    )
+    if not tests_ok:
+        return output, False, True, False, True, []
+    smoke_ran = False
+    if task.smoke_command:
+        smoke = run_smoke(
+            task.smoke_command,
+            cwd=project,
+            mode=task.smoke_mode,
+            timeout=task.smoke_timeout,
+            launch_seconds=task.smoke_launch_seconds,
+            fail_on_traceback=task.smoke_fail_on_traceback,
+        )
+        smoke_ran = True
+        logger.event(
+            "smoke",
+            iteration=iteration,
+            passed=smoke.ok,
+            reason=smoke.reason,
+            output=smoke.output,
+            summary=f"smoke {smoke.reason}",
+        )
+        if not smoke.ok:
+            failed = output + "\n\nSmoke check failed:\n" + smoke.output
+            return failed, True, False, True, True, []
+        output = output + "\n\nSmoke check passed.\n" + smoke.output
+    verify_results = _run_verify_commands(task.verify_commands, project, task.verify_timeout)
+    if not verify_results:
+        return output, True, True, smoke_ran, True, []
+    verify_ok = all(item.ok for item in verify_results)
+    output = output + "\n\n" + _format_verify_log(verify_results, verify_ok)
     logger.event(
-        "smoke",
+        "verify",
         iteration=iteration,
-        passed=smoke.ok,
-        reason=smoke.reason,
-        output=smoke.output,
-        summary=f"smoke {smoke.reason}",
+        passed=verify_ok,
+        commands=[{"command": item.command, "ok": item.ok, "exit_code": item.exit_code} for item in verify_results],
+        summary=f"verify passed={verify_ok} ({len(verify_results)} commands)",
     )
-    if smoke.ok:
-        return output + "\n\nSmoke check passed.\n" + smoke.output, True, True, True
-    failed = output + "\n\nSmoke check failed:\n" + smoke.output
-    return failed, True, False, True
+    return output, True, True, smoke_ran, verify_ok, verify_results
+
+
+def _run_verify_commands(
+    commands: list[str], cwd: Path, timeout: int
+) -> list[VerifyCommandResult]:
+    """Run each verify command. A `&&` chain stops at the first failing step."""
+
+    results: list[VerifyCommandResult] = []
+    for command in commands:
+        for step in platform_shell_commands(command):
+            ran = run_command(step, cwd=cwd, timeout=timeout)
+            results.append(
+                VerifyCommandResult(
+                    command=step,
+                    ok=ran.ok,
+                    exit_code=_exit_code_from_output(ran.output),
+                    output=ran.output,
+                )
+            )
+            if not ran.ok:
+                break
+    return results
+
+
+def _format_verify_log(results: list[VerifyCommandResult], ok: bool) -> str:
+    head = "Verify check passed." if ok else "Verify check failed:"
+    parts = [head]
+    for item in results:
+        parts.append(f"$ {item.command}\n{item.output}")
+    return "\n".join(parts)
+
+
+def _exit_code_from_output(output: str) -> int | None:
+    match = re.search(r"(?m)^exit_code:\s*(-?\d+)\s*$", output or "")
+    if not match:
+        return None
+    return int(match.group(1))
 
 
 def _fix_user_prompt(
@@ -1259,6 +1433,7 @@ def _fix_user_prompt(
     test_output: str,
     *,
     smoke_failed: bool,
+    verify_failed: bool = False,
     false_pass_reason: str = "",
     cheat_sheet: str = "",
     api_patterns: tuple[str, ...] = (),
@@ -1271,6 +1446,7 @@ def _fix_user_prompt(
         shrink_text(test_output, 12_000),
         _status_short(project),
         smoke_failed=smoke_failed,
+        verify_failed=verify_failed,
         diff_text=diff,
         traceback_files=cited,
         false_pass_reason=false_pass_reason,
@@ -1400,6 +1576,8 @@ def _finish(
     open_questions: str = "",
     smoke_passed: bool = True,
     smoke_ran: bool = False,
+    verify_passed: bool = True,
+    verify_ran: bool = False,
     test_output_full: str = "",
     review_full: str = "",
     attempt: int = 0,
@@ -1424,6 +1602,8 @@ def _finish(
         review_passed=review_passed,
         smoke_passed=smoke_passed,
         smoke_ran=smoke_ran,
+        verify_passed=verify_passed,
+        verify_ran=verify_ran,
         attempt=attempt,
         prior_attempt=prior_attempt,
         snapshot_refs=refs,
@@ -1446,6 +1626,8 @@ def _finish(
         review_passed=review_passed,
         smoke_passed=smoke_passed,
         smoke_ran=smoke_ran,
+        verify_passed=verify_passed,
+        verify_ran=verify_ran,
         test_output=stored_output,
         review=stored_review,
         attempts=attempt or 1,
@@ -1471,6 +1653,8 @@ def _render_report(
     review_passed: bool = True,
     smoke_passed: bool = True,
     smoke_ran: bool = False,
+    verify_passed: bool = True,
+    verify_ran: bool = False,
     attempt: int = 0,
     prior_attempt: str = "",
     snapshot_refs: list[str] | None = None,
@@ -1482,6 +1666,10 @@ def _render_report(
         smoke_line = "- Smoke: not run\n"
     else:
         smoke_line = f"- Smoke passed: {'yes' if smoke_passed else 'no'}\n"
+    if not verify_ran:
+        verify_line = "- Verify: not run\n"
+    else:
+        verify_line = f"- Verify passed: {'yes' if verify_passed else 'no'}\n"
     attempt_line = f"- Attempt: {attempt}\n" if attempt else ""
     earlier = ""
     if prior_attempt.strip():
@@ -1498,6 +1686,7 @@ def _render_report(
         f"- Tests passed: {'yes' if tests_passed else 'no'}\n"
         f"- Review passed: {'yes' if review_passed else 'no'}\n"
         f"{smoke_line}"
+        f"{verify_line}"
         f"- Profile: {profile_name}\n"
         f"- Task: {task.title}\n"
         f"- Branch: {branch}\n"
@@ -1933,6 +2122,7 @@ def failure_summary(result: OvernightResult) -> str:
         f"Branch: {result.branch}",
         f"Tests passed: {'yes' if result.tests_passed else 'no'}",
         f"Smoke passed: {'yes' if result.smoke_passed else 'no'}",
+        f"Verify passed: {'yes' if result.verify_passed else 'no'}",
         f"Review passed: {'yes' if result.review_passed else 'no'}",
         f"Iterations: {result.iterations}",
     ]
@@ -1947,7 +2137,7 @@ def failure_summary(result: OvernightResult) -> str:
 
 
 def _passed(result: OvernightResult) -> bool:
-    return bool(result.tests_passed and result.review_passed and result.smoke_passed)
+    return bool(result.tests_passed and result.review_passed and result.smoke_passed and result.verify_passed)
 
 
 def run_with_retries(
@@ -1996,6 +2186,7 @@ def run_with_retries(
                 "tests_passed": last.tests_passed,
                 "review_passed": last.review_passed,
                 "smoke_passed": last.smoke_passed,
+                "verify_passed": last.verify_passed,
             }
         )
         last.attempts = attempt

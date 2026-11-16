@@ -18,6 +18,10 @@ context:
 must_exist:
   - src/app.py
   - test_widget
+verify_commands:
+  - python app.py --frames 60
+verify_timeout: 120
+extract_verify_commands: false
 plan_turns: 8
 implement_turns: 30
 exploration_cap: 10
@@ -81,11 +85,14 @@ contradicts `AGENTS.md` or this file fails the self-review.
 | `blocked_probes` | No | Extra regular expressions refused as shell commands, added to the built-in probe list (ilspycmd, `dotnet new`, reflection loads, and similar). |
 | `api_error_patterns` | No | Extra substrings that mark a build or compile failure as API misuse. The defaults are `CS1503`, `CS0214`, `CS1061`, and `CS0117`. A match re-injects the cheat sheet into the fix prompt. |
 | `scratch_dirs` | No | Extra directory names the model may not create unless the plan names that path. Defaults include `diag`, `apicheck`, `api-check`, `_probe`, `scratch`, and `throwaway`. |
-| `review_verify_only_pass` | No | Default `true`. A review that votes `fix` (or reject / needs changes) is accepted when every open item only asks to run, verify, check, or confirm, and the harness build, tests, `must_exist`, and smoke checks all passed. The runner logs `review_verify_only_pass` with those items. A concrete defect still starts review-fix. A claim that a file or symbol is missing is dropped when the tree contains it. Set `false` to keep every `fix` vote on the review-fix path. |
+| `verify_commands` | No | Commands the runner executes after tests and smoke pass, before review. Each command's exit code and an output tail are included in the harness checks the reviewer sees. A nonzero exit or a timeout fails the iteration and is pasted into the fix prompt, the same way a smoke failure is. A YAML list or a comma-separated line. On Windows the shell is PowerShell 5.1: `&&` is split into separate steps, and a command that starts with a quoted path is invoked with `&`. |
+| `verify_timeout` | No | Seconds for each verify command. Default 120, maximum 600. |
+| `extract_verify_commands` | No | Default `false`. When `true`, backtick-quoted run commands in Acceptance criteria are added to `verify_commands`. A flag fragment such as `` `--frames 60` ``, a function call, or a bare filename is not extracted. Leave this off unless the criteria name real commands. |
+| `review_verify_only_pass` | No | Default `true`. A review that votes `accept` or `fix` (or reject / needs changes) is accepted when every open item only asks to run, verify, check, or confirm, and the harness build, tests, `must_exist`, smoke, and verify commands all passed. An acceptance line marked `not met` or `unverified` counts as verify-only when its only stated reason is that the harness did not run or execute the check. The runner logs `review_verify_only_pass` with those items. A concrete defect, including an ambiguous `not met` line, still starts review-fix. A claim that a file or symbol is missing is dropped when the tree contains it. Set `false` to keep every such vote on the review-fix path. |
 
 A task file may start with a UTF-8 BOM. It is stripped before front matter is read. If the file starts with `---` and has no closing `---`, `validate` reports that the front matter could not be parsed instead of a missing `test_command`.
 
-`plan_turns`, `implement_turns`, `exploration_cap`, `exploration_bonus_turns`, `cheat_sheet_marker`, and `review_verify_only_pass` may also sit in the target repo's `AGENTS.md` front matter. A key set on the task wins, then `AGENTS.md`, then the profile. `review_verify_only_pass` may also be set on the profile in `profiles/models.json` or `runtime/overrides.json`.
+`plan_turns`, `implement_turns`, `exploration_cap`, `exploration_bonus_turns`, `cheat_sheet_marker`, `review_verify_only_pass`, `verify_commands`, `verify_timeout`, and `extract_verify_commands` may also sit in the target repo's `AGENTS.md` front matter. A key set on the task wins, then `AGENTS.md`, then the profile. `review_verify_only_pass` and `extract_verify_commands` may also be set on the profile in `profiles/models.json` or `runtime/overrides.json`. `extract_verify_commands` defaults to false.
 
 The same smoke keys can sit in the front matter of the target repo's `AGENTS.md`. A key set on the task wins. `validate` prints a warning, and still exits 0, when a task mentions a GUI toolkit or a server and neither the task nor `AGENTS.md` sets `smoke_command`. Other tasks are not warned about.
 

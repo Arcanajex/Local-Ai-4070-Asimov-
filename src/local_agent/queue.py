@@ -518,7 +518,12 @@ def run_queue(
             persist(in_progress=True)
             _return_to_base(project, base_branch)
             break
-        if result.tests_passed and result.review_passed and getattr(result, "smoke_passed", True):
+        if (
+            result.tests_passed
+            and result.review_passed
+            and getattr(result, "smoke_passed", True)
+            and getattr(result, "verify_passed", True)
+        ):
             try:
                 merge_commit = merge_no_ff(project, base_branch, result.branch) if result.branch else ""
             except Exception as exc:
