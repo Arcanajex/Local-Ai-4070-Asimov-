@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import os
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 
@@ -20,6 +19,7 @@ from local_agent.client import ChatResult, ToolCall
 from local_agent.config import Profile, get_profile
 from local_agent.overnight import OvernightResult, load_task, run_overnight
 from local_agent.paths import repo_root
+from local_agent.shells import python_shell
 
 ADDER_BUG = "def add(a, b):\n    return a - b\n"
 ADDER_TEST = "from adder import add\n\n\ndef test_add():\n    assert add(2, 3) == 5\n"
@@ -107,7 +107,7 @@ def run_mock_smoke(root: Path | None = None) -> OvernightResult:
         max_seconds=120,
         max_plan_turns=2,
         max_work_turns=6,
-        test_command=f"{sys.executable} -m pytest -q",
+        test_command=python_shell("-m", "pytest", "-q"),
         lint_command=None,
     )
 
@@ -135,7 +135,7 @@ def run_live_smoke(profile_name: str, base_url: str | None, max_minutes: float) 
         max_seconds=max_minutes * 60,
         max_plan_turns=6,
         max_work_turns=12,
-        test_command=f"{sys.executable} -m pytest -q",
+        test_command=python_shell("-m", "pytest", "-q"),
         lint_command=None,
     )
 

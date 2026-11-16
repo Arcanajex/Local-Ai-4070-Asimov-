@@ -240,21 +240,40 @@ def _parse_front_matter(block: str) -> tuple[dict[str, str], dict[str, list[str]
             continue
         key, value = line.split(":", 1)
         key = key.strip()
-        value = value.strip().strip('"').strip("'")
+        value = _unwrap_wrapping_quotes(value)
         if key in _LIST_KEYS and not value:
             index += 1
             while index < len(lines) and lines[index].lstrip().startswith("- "):
-                item = lines[index].lstrip()[2:].strip().strip('"').strip("'")
+                item = _unwrap_wrapping_quotes(lines[index].lstrip()[2:])
                 if item:
                     lists[key].append(item)
                 index += 1
             continue
         if key in _LIST_KEYS:
-            lists[key].extend(part.strip() for part in value.split(",") if part.strip())
+            lists[key].extend(
+                item
+                for part in value.split(",")
+                if (item := _unwrap_wrapping_quotes(part))
+            )
         else:
             meta[key] = value
         index += 1
     return meta, lists
+
+
+def _unwrap_wrapping_quotes(value: str) -> str:
+    """Drop one pair of quotes that wrap a whole front-matter value.
+
+    ``test_command: "npm test"`` is stored as ``npm test``. A shell command
+    that quotes its own arguments starts or ends with a quote without being
+    wrapped as one string. ``str.strip`` would delete that closing quote, and
+    PowerShell would then refuse the command.
+    """
+
+    text = value.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"} and text[0] not in text[1:-1]:
+        return text[1:-1].strip()
+    return text
 
 
 def _truthy(value: str) -> bool:
