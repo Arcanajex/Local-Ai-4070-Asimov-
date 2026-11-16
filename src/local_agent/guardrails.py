@@ -199,13 +199,57 @@ def planned_paths(plan_text: str) -> list[str]:
     return found
 
 
+def false_pass_release(
+    gap: str | None,
+    *,
+    fix_produced_changes: bool = False,
+    consecutive_noop_fixes: int = 0,
+    implement_status: str = "",
+) -> tuple[str, bool] | None:
+    """Why a passing gate should be accepted, or None while the guard blocks.
+
+    Returns `(reason, accept_remaining_gap)`. The second flag is true when
+    the release is a fix that changed files, or the two-noop safety valve:
+    the cumulative diff may still look like a gap, and that must not be
+    re-imposed after review. A release because the diff itself is real is
+    re-checked at the end, since review-fix can still undo the tree.
+
+    `gap` is `implementation_gap` on the cumulative diff from the task's base
+    commit, not the last round and not `HEAD`. Implement ending on
+    `turn_budget` or `exploration_capped` is not a reason to keep blocking
+    once that diff is real. A fix round that changed files clears the guard
+    on the next passing gate. Two passing-gate fix rounds in a row that
+    change no files release it anyway, so a stuck check cannot spend the
+    iteration budget.
+    """
+
+    if not gap:
+        note = "cumulative diff from the task base covers the planned files"
+        if implement_status in {"turn_budget", "exploration_capped"}:
+            note += (
+                f"; implement ended on {implement_status}, which does not block "
+                "once that diff is real"
+            )
+        return note, False
+    if fix_produced_changes:
+        return "a fix round produced real file changes and the gate passed", True
+    if consecutive_noop_fixes >= 2:
+        return (
+            "two consecutive fix rounds made no file changes and the gate passed; "
+            f"stopping the false-pass loop ({gap})",
+            True,
+        )
+    return None
+
+
 def implementation_gap(plan_text: str, diff_text: str) -> str | None:
     """Why a green test run is not success, or None when the diff is real.
 
     An empty diff is always a gap. When the plan names files, a diff that
     does not substantively touch any of them is near-empty relative to that
     plan. A one-line edit of a named file is enough: that is a real change,
-    not a near-empty one.
+    not a near-empty one. The caller passes the cumulative diff from the
+    task's base commit.
     """
 
     changed = diff_changed_files(diff_text)

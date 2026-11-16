@@ -13,6 +13,7 @@ from local_agent.guardrails import (
     EXPLORATION_NUDGE,
     PhaseGuard,
     collect_cheat_sheets,
+    false_pass_release,
     has_leaked_tool_markup,
     implementation_gap,
     missing_must_exist,
@@ -22,7 +23,7 @@ from local_agent.guardrails import (
 )
 from local_agent.harness import AgentHarness
 from local_agent.logging_util import RunLogger
-from local_agent.overnight import load_task, parse_task, run_overnight
+from local_agent.overnight import load_task, parse_task, run_overnight, working_tree_diff
 from local_agent.paths import repo_root
 from local_agent.prompts import review_fix_prompt, review_format_reminder
 from local_agent.taskcheck import review_form_problems, validate_task
@@ -196,6 +197,183 @@ def test_empty_diff_and_turn_budget_do_not_count_as_success(tmp_path):
     )
     assert stuck.status == "false_pass"
     assert stuck.tests_passed is False
+
+
+def test_turn_budget_after_real_files_goes_to_review_without_looping(tmp_path):
+    """The guard used to stay shut after implement hit the turn budget.
+
+    A real run then spent every later fix round on a tree that already passed
+    must_exist, tests, and smoke. The model said the files were in place.
+    Committing during implement made `git diff HEAD` empty, so the planned-file
+    check never saw the cumulative work.
+    """
+
+    project = _repo(tmp_path / "repo")
+    (project / "test_keep.py").write_text("def test_keep():\n    assert True\n", encoding="utf-8")
+    subprocess.run(["git", "add", "test_keep.py"], cwd=project, check=True)
+    subprocess.run(["git", "commit", "-m", "tests"], cwd=project, check=True, stdout=subprocess.DEVNULL)
+    plan = "1. Create feature.py with answer()."
+    fixes = {"n": 0}
+
+    class Client:
+        def __init__(self):
+            self.impl = 0
+
+        def chat(self, messages, *, tools, max_tokens):
+            prompt = _user(messages)
+            if "Review the diff" in prompt or "not a usable review" in prompt:
+                return _text(GOOD_REVIEW)
+            if "not success" in prompt or "False pass" in prompt:
+                fixes["n"] += 1
+                return _text("The task is complete. 46/46. All files are already in place and fully verified.")
+            if "Implement the task." in prompt:
+                self.impl += 1
+                if self.impl == 1:
+                    return _call(
+                        "write",
+                        {"path": "feature.py", "content": "def answer():\n    return 42\n"},
+                    )
+                if self.impl == 2:
+                    return _call(
+                        "shell",
+                        {"command": "git add feature.py && git commit -m 'add feature'"},
+                    )
+                return _call("read", {"path": "feature.py"})
+            return _text(plan)
+
+    result = run_overnight(
+        task=_task(
+            tmp_path,
+            "---\n"
+            "test_command: true\n"
+            "must_exist:\n"
+            "  - feature.py\n"
+            "---\n" + _body("feature"),
+        ),
+        project=project,
+        profile=_day(),
+        client=Client(),
+        log_dir=tmp_path / "logs",
+        max_iterations=8,
+        max_seconds=60,
+        max_plan_turns=1,
+        max_work_turns=3,
+    )
+    phases = [_phase(line) for line in _events(tmp_path)]
+    assert result.status == "passed", result.review
+    assert result.tests_passed is True
+    assert result.review_passed is True
+    assert result.iterations == 1
+    assert fixes["n"] == 0
+    assert "review" in phases
+    assert not any(phase.startswith("fix-") for phase in phases)
+    assert (project / "feature.py").is_file()
+    events = [json.loads(line) for line in _events(tmp_path)]
+    guards = [item for item in events if item.get("kind") == "false_pass_guard"]
+    assert guards and guards[-1]["action"] == "release"
+    assert "cumulative diff" in guards[-1]["summary"]
+    assert "turn_budget" in guards[-1]["summary"]
+    must = [item for item in events if item.get("kind") == "must_exist"]
+    assert must and must[-1]["missing"] == [] and must[-1]["passed"] is True
+    # HEAD is the agent's commit, so a diff against HEAD is empty. The base is not.
+    head_diff = working_tree_diff(project)
+    assert "feature.py" not in head_diff or "no changes" in head_diff
+    base = next(item["commit"] for item in events if item.get("kind") == "task_base")
+    cumulative = working_tree_diff(project, base)
+    assert "feature.py" in cumulative
+    assert implementation_gap(plan, cumulative) is None
+    assert implementation_gap(plan, head_diff)
+
+
+def test_uncommitted_turn_budget_does_not_need_a_noop_fix(tmp_path):
+    project = _repo(tmp_path / "repo")
+    plan = "1. Create feature.py with answer()."
+    fixes = {"n": 0}
+
+    class Client:
+        def __init__(self):
+            self.impl = 0
+
+        def chat(self, messages, *, tools, max_tokens):
+            prompt = _user(messages)
+            if "Review the diff" in prompt or "not a usable review" in prompt:
+                return _text(GOOD_REVIEW)
+            if "not success" in prompt or "False pass" in prompt:
+                fixes["n"] += 1
+                return _text("All files are already in place and fully verified.")
+            if "Implement the task." in prompt:
+                self.impl += 1
+                if self.impl == 1:
+                    return _call("write", {"path": "feature.py", "content": "def answer():\n    return 42\n"})
+                return _call("read", {"path": "feature.py"})
+            return _text(plan)
+
+    result = run_overnight(
+        task=_task(tmp_path, "---\ntest_command: true\nmust_exist:\n  - feature.py\n---\n" + _body("plain")),
+        project=project,
+        profile=_day(),
+        client=Client(),
+        log_dir=tmp_path / "logs",
+        max_iterations=8,
+        max_seconds=60,
+        max_plan_turns=1,
+        max_work_turns=2,
+    )
+    phases = [_phase(line) for line in _events(tmp_path)]
+    assert result.status == "passed", result.review
+    assert result.iterations == 1
+    assert fixes["n"] == 0
+    assert not any(phase.startswith("fix-") for phase in phases)
+    assert "review" in phases
+    release = [json.loads(line) for line in _events(tmp_path) if "\"false_pass_guard\"" in line]
+    assert release and release[-1]["action"] == "release"
+
+
+def test_two_noop_fix_rounds_release_the_guard_and_review(tmp_path):
+    project = _repo(tmp_path / "repo")
+    plan = "1. Create feature.py with answer()."
+    assert false_pass_release("implement produced an empty diff", consecutive_noop_fixes=1) is None
+    assert false_pass_release("implement produced an empty diff", consecutive_noop_fixes=2)
+    assert false_pass_release(None, implement_status="turn_budget")
+    assert false_pass_release("diff is empty relative to the files the plan named (feature.py)", fix_produced_changes=True)
+
+    class Client:
+        def chat(self, messages, *, tools, max_tokens):
+            prompt = _user(messages)
+            if "Review the diff" in prompt or "not a usable review" in prompt:
+                return _text(GOOD_REVIEW)
+            if "Implement the task." in prompt:
+                return _call("read", {"path": "README.md"})
+            if "not success" in prompt or "False pass" in prompt:
+                return _text("The task is complete. All files are already in place and fully verified.")
+            return _text(plan)
+
+    (project / "README.md").write_text("notes\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=project, check=True)
+    subprocess.run(["git", "commit", "-m", "notes"], cwd=project, check=True, stdout=subprocess.DEVNULL)
+    result = run_overnight(
+        task=_task(tmp_path, "---\ntest_command: true\n---\n" + _body("stuck-loop")),
+        project=project,
+        profile=_day(),
+        client=Client(),
+        log_dir=tmp_path / "logs",
+        max_iterations=8,
+        max_seconds=60,
+        max_plan_turns=1,
+        max_work_turns=1,
+    )
+    phases = [phase for phase in (_phase(line) for line in _events(tmp_path)) if phase]
+    fix_phases = [phase for phase in phases if phase.startswith("fix-")]
+    assert fix_phases == ["fix-1", "fix-2"]
+    assert "review" in phases
+    assert result.status == "passed", result.review
+    assert result.tests_passed is True
+    events = [json.loads(line) for line in _events(tmp_path)]
+    guards = [item for item in events if item.get("kind") == "false_pass_guard"]
+    assert [item["action"] for item in guards] == ["block", "block", "release"]
+    assert "two consecutive fix rounds" in guards[-1]["summary"]
+    assert "no file changes" in guards[-1]["summary"]
+    assert not (project / "feature.py").exists()
 
 
 def test_must_exist_blocks_a_green_test_command(tmp_path):

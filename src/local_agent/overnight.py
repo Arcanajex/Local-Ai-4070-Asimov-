@@ -31,6 +31,7 @@ from local_agent.guardrails import (
     PLAN_EXPLORATION_NUDGE,
     PhaseGuard,
     collect_cheat_sheets,
+    false_pass_release,
     implementation_gap,
     looks_like_api_misuse,
     missing_must_exist,
@@ -432,6 +433,10 @@ def run_overnight(
             summary=f"project context {len(context_block)} chars",
         )
         branch = _create_branch(project, slugify(task.title), attempt=branch_attempt)
+        # The commit the task started from. Later agent commits move HEAD, so a
+        # diff against HEAD would only see the last round and look empty.
+        base_sha = _git(project, "rev-parse", "HEAD").strip() if _head_exists(project) else ""
+        logger.event("task_base", commit=base_sha, summary=f"task base {base_sha[:12] or '(none)'}")
         markers = list(profile.cheat_sheet_markers) or list(DEFAULT_CHEAT_MARKERS)
         if task.cheat_sheet_marker and task.cheat_sheet_marker.lower() not in {item.lower() for item in markers}:
             markers.append(task.cheat_sheet_marker)
@@ -517,20 +522,35 @@ def run_overnight(
         test_output = ""
         iterations = 0
         stop_status = implement.status
-        implement_incomplete = implement.status in {"turn_budget", "exploration_capped"}
+        # Sticky across a real edit. A later no-op does not clear it: the gate
+        # that follows a round which changed files is success even if the plan
+        # matcher is still unhappy. The no-op streak only counts rounds that
+        # ran after a passing gate, which is when the guard is the thing looping.
+        fix_produced_changes = False
+        consecutive_noop_fixes = 0
+        # Set when a fix round's edits, or the two-noop valve, accept a gate
+        # the cumulative diff still calls a gap. A clean diff is re-checked
+        # after review-fix, because that later phase can undo the tree.
+        accept_remaining_gap = False
 
-        def acceptance_block(incomplete: bool) -> str | None:
-            reasons: list[str] = []
-            if incomplete:
-                reasons.append(
-                    "implement stopped on the turn budget or the exploration cap before it finished"
-                )
-            gap = implementation_gap(plan_text, working_tree_diff(project))
-            if gap:
-                reasons.append(gap)
-            if not reasons:
-                return None
-            return " ".join(reasons)
+        def cumulative_gap() -> str | None:
+            return implementation_gap(plan_text, working_tree_diff(project, base_sha))
+
+        def release_guard(reason: str, *, accept_gap: bool) -> None:
+            nonlocal stop_status, accept_remaining_gap
+            if accept_gap:
+                accept_remaining_gap = True
+            _log_guard(logger, "release", iterations, reason, implement_status=implement.status, base=base_sha[:12])
+            _record_snapshot(project, branch, snapshots, logger)
+            stop_status = "passed"
+
+        def note_fix_edits(before: dict[str, bytes]) -> bool:
+            nonlocal fix_produced_changes, consecutive_noop_fixes
+            changed = bool(changed_rels(before, snapshot_tree(project)))
+            if changed:
+                fix_produced_changes = True
+                consecutive_noop_fixes = 0
+            return changed
 
         for iterations in range(1, max_iterations + 1):
             if time.monotonic() >= deadline:
@@ -541,53 +561,88 @@ def run_overnight(
             )
             smoke_ran = smoke_ran or ran_smoke
             if tests_passed and smoke_passed:
-                gap_reason = acceptance_block(implement_incomplete)
-                if gap_reason:
-                    logger.event("false_pass", iteration=iterations, summary=gap_reason[:500])
-                    if iterations == max_iterations:
-                        stop_status = "false_pass"
-                        tests_passed = False
-                        test_output = (
-                            test_output
-                            + "\n\nFalse pass: "
-                            + gap_reason
-                            + "\nPassing tests were not counted.\n"
-                        )
-                        break
-                    implement_incomplete = False
-                    fix = _run_phase(
-                        client, workspace, logger, profile,
-                        with_project_context(
-                            _fix_user_prompt(
-                                task,
-                                project,
-                                test_output,
-                                smoke_failed=False,
-                                false_pass_reason=gap_reason,
-                                cheat_sheet=cheat_sheet,
-                                api_patterns=api_patterns,
-                            ),
-                            context_block,
-                        ),
-                        allowed=None,
-                        max_turns=max_work_turns,
-                        deadline=deadline,
-                        phase=f"fix-{iterations}",
-                        guard=work_guard,
+                gap_reason = cumulative_gap()
+                release = false_pass_release(
+                    gap_reason,
+                    fix_produced_changes=fix_produced_changes,
+                    consecutive_noop_fixes=consecutive_noop_fixes,
+                    implement_status=implement.status,
+                )
+                if release:
+                    reason, accept_gap = release
+                    release_guard(reason, accept_gap=accept_gap)
+                    break
+                gap_reason = gap_reason or "diff does not cover the planned files"
+                _log_guard(
+                    logger,
+                    "block",
+                    iterations,
+                    gap_reason,
+                    implement_status=implement.status,
+                    base=base_sha[:12],
+                )
+                logger.event("false_pass", iteration=iterations, summary=gap_reason[:500])
+                if iterations == max_iterations:
+                    stop_status = "false_pass"
+                    tests_passed = False
+                    test_output = (
+                        test_output
+                        + "\n\nFalse pass: "
+                        + gap_reason
+                        + "\nPassing tests were not counted.\n"
                     )
-                    if fix.status in {"empty_reply", "loop_detected"}:
-                        stop_status = fix.status
-                        break
-                    continue
-                _record_snapshot(project, branch, snapshots, logger)
-                stop_status = "passed"
-                break
+                    break
+                before_fix = snapshot_tree(project)
+                fix = _run_phase(
+                    client, workspace, logger, profile,
+                    with_project_context(
+                        _fix_user_prompt(
+                            task,
+                            project,
+                            test_output,
+                            smoke_failed=False,
+                            false_pass_reason=gap_reason,
+                            cheat_sheet=cheat_sheet,
+                            api_patterns=api_patterns,
+                            base=base_sha,
+                        ),
+                        context_block,
+                    ),
+                    allowed=None,
+                    max_turns=max_work_turns,
+                    deadline=deadline,
+                    phase=f"fix-{iterations}",
+                    guard=work_guard,
+                )
+                if not note_fix_edits(before_fix):
+                    consecutive_noop_fixes += 1
+                # The gate already passed and the tree did not move. Another
+                # test run would only start another fix round.
+                if consecutive_noop_fixes >= 2:
+                    valve = false_pass_release(
+                        gap_reason,
+                        consecutive_noop_fixes=consecutive_noop_fixes,
+                        implement_status=implement.status,
+                    )
+                    reason, accept_gap = valve or (
+                        "two consecutive fix rounds made no file changes and the gate passed; "
+                        f"stopping the false-pass loop ({gap_reason})",
+                        True,
+                    )
+                    release_guard(reason, accept_gap=accept_gap)
+                    break
+                if fix.status in {"empty_reply", "loop_detected"}:
+                    stop_status = fix.status
+                    break
+                continue
+            consecutive_noop_fixes = 0
             if iterations == max_iterations:
                 stop_status = "iteration_budget"
                 break
             if time.monotonic() >= deadline:
                 stop_status = "time_budget"
                 break
+            before_fix = snapshot_tree(project)
             fix = _run_phase(
                 client, workspace, logger, profile,
                 with_project_context(
@@ -598,6 +653,7 @@ def run_overnight(
                         smoke_failed=tests_passed and not smoke_passed,
                         cheat_sheet=cheat_sheet,
                         api_patterns=api_patterns,
+                        base=base_sha,
                     ),
                     context_block,
                 ),
@@ -607,6 +663,7 @@ def run_overnight(
                 phase=f"fix-{iterations}",
                 guard=work_guard,
             )
+            note_fix_edits(before_fix)
             if fix.status in {"time_budget", "empty_reply", "loop_detected", "exploration_capped"}:
                 stop_status = fix.status
                 # Still run the checks once more if the model managed to edit before stopping.
@@ -615,9 +672,15 @@ def run_overnight(
                         project, test_cmd, lint_cmd, task, logger, iterations
                     )
                     smoke_ran = smoke_ran or ran_smoke
-                    if tests_passed and smoke_passed and not acceptance_block(False):
-                        _record_snapshot(project, branch, snapshots, logger)
-                        stop_status = "passed"
+                    release = false_pass_release(
+                        cumulative_gap(),
+                        fix_produced_changes=fix_produced_changes,
+                        consecutive_noop_fixes=consecutive_noop_fixes,
+                        implement_status=implement.status,
+                    )
+                    if tests_passed and smoke_passed and release:
+                        reason, accept_gap = release
+                        release_guard(reason, accept_gap=accept_gap)
                 break
         else:
             stop_status = "iteration_budget"
@@ -647,6 +710,7 @@ def run_overnight(
                     snapshots=snapshots,
                     branch=branch,
                     restore_note=restore_note,
+                    base=base_sha,
                 )
             )
         if restore_note["ref"] and not restored_snapshot:
@@ -672,8 +736,11 @@ def run_overnight(
             "restored_snapshot",
         }
         if tests_passed and smoke_passed and review_passed and stop_status not in kept_failure:
-            # A later fix can clear an earlier false pass. An empty diff cannot.
-            if implementation_gap(plan_text, working_tree_diff(project)):
+            # Re-check the cumulative diff. Review-fix can undo a tree that
+            # looked real. A gap the guard already released on purpose (a fix
+            # round that changed files, or two no-op rounds) stays released.
+            end_gap = implementation_gap(plan_text, working_tree_diff(project, base_sha))
+            if end_gap and not accept_remaining_gap:
                 report_status = "false_pass"
                 tests_passed = False
             else:
@@ -747,6 +814,7 @@ def _review_and_maybe_fix(
     snapshots: list[Snapshot],
     branch: str,
     restore_note: dict[str, str] | None = None,
+    base: str = "",
 ) -> tuple[str, bool, bool, bool, bool, str, str]:
     """Review once. Only a well-formed review can reject the change.
 
@@ -768,6 +836,7 @@ def _review_and_maybe_fix(
         phase="review",
         test_first_files=test_first_files,
         smoke_passed=None if not smoke_ran else smoke_passed,
+        base=base,
     )
     if malformed:
         logger.event("review_unusable", summary="malformed review was not sent to review-fix")
@@ -831,6 +900,7 @@ def _review_and_maybe_fix(
         phase="review-again",
         test_first_files=test_first_files,
         smoke_passed=None if not smoke_ran else smoke_passed,
+        base=base,
     )
     if malformed:
         logger.event("review_unusable", summary="second review was malformed and was not sent to another fix")
@@ -855,6 +925,7 @@ def _one_review(
     phase: str,
     test_first_files: str = "",
     smoke_passed: bool | None = None,
+    base: str = "",
 ) -> tuple[str, list[str], bool]:
     """Returns review text, substantive problems, and whether the reply is unusable.
 
@@ -868,7 +939,7 @@ def _one_review(
     for attempt in range(3):
         prompt = review_prompt(
             task.body,
-            fit_review_diff(working_tree_diff(workspace.root), REVIEW_DIFF_CHARS),
+            fit_review_diff(working_tree_diff(workspace.root, base), REVIEW_DIFF_CHARS),
             tests_passed,
             acceptance=extract_section(task.body, "Acceptance criteria"),
             out_of_scope=extract_section(task.body, "Out of scope"),
@@ -925,6 +996,20 @@ def _run_phase(
     result = harness.run(prompt, max_turns=max_turns, deadline=deadline, guard=guard)
     logger.event("phase_end", phase=phase, status=result.status, summary=f"{phase} {result.status}")
     return result
+
+
+def _log_guard(logger: RunLogger, action: str, iteration: Any, reason: str, **extra: Any) -> None:
+    """One events.jsonl row each time the false-pass guard blocks or releases."""
+
+    text = (reason or "").strip()
+    logger.event(
+        "false_pass_guard",
+        action=action,
+        iteration=iteration,
+        reason=text[:500],
+        summary=f"false_pass_guard {action}: {text[:300]}",
+        **extra,
+    )
 
 
 def _record_snapshot(project: Path, branch: str, snapshots: list[Snapshot], logger: RunLogger) -> None:
@@ -1042,8 +1127,9 @@ def _fix_user_prompt(
     false_pass_reason: str = "",
     cheat_sheet: str = "",
     api_patterns: tuple[str, ...] = (),
+    base: str = "",
 ) -> str:
-    diff = fit_review_diff(working_tree_diff(project), FIX_DIFF_CHARS)
+    diff = fit_review_diff(working_tree_diff(project, base), FIX_DIFF_CHARS)
     cited = format_traceback_files(project, test_output)
     return fix_prompt(
         task.body,
@@ -1559,28 +1645,33 @@ def _config_get(project: Path, key: str) -> str:
 _NEW_FILE_CHARS = 12_000
 
 
-def working_tree_diff(project: Path) -> str:
-    """Full change set against HEAD, including files git has never tracked.
+def working_tree_diff(project: Path, base: str | None = None) -> str:
+    """Full change set against `base` (or HEAD), including untracked files.
 
-    `git diff` and `git diff HEAD` only describe tracked files. A run that
-    starts from an empty commit and creates textstats.py leaves those files
-    untracked until the final `git add`, so a review that only ran `git diff`
-    told the model the diff was missing.
+    `git diff` and `git diff HEAD` only describe tracked files, and `git diff
+    HEAD` drops anything already committed on the agent branch. The false-pass
+    guard passes the task's base commit so a later `git commit` does not make
+    the cumulative work look empty. A run that starts from an empty commit and
+    creates textstats.py leaves those files untracked until the final
+    `git add`, so a review that only ran `git diff` told the model the diff
+    was missing.
     """
 
+    revision = (base or "").strip() or "HEAD"
+    label = "HEAD" if revision == "HEAD" else revision[:12]
     tracked_stat = ""
     tracked_patch = ""
-    if _head_exists(project):
-        tracked_stat = _git(project, "diff", "HEAD", "--stat").strip()
-        tracked_patch = _git(project, "diff", "HEAD").strip()
+    if _rev_exists(project, revision):
+        tracked_stat = _git(project, "diff", revision, "--stat").strip()
+        tracked_patch = _git(project, "diff", revision).strip()
     untracked = [
         line.strip()
         for line in _git(project, "ls-files", "--others", "--exclude-standard").splitlines()
         if line.strip()
     ]
     if not tracked_stat and not tracked_patch and not untracked:
-        return "(no changes relative to HEAD)\n"
-    parts = ["# Changes since HEAD", ""]
+        return f"(no changes relative to {label})\n"
+    parts = [f"# Changes since {label}", ""]
     if tracked_stat:
         parts.append(tracked_stat)
     if untracked:
@@ -1597,8 +1688,14 @@ def working_tree_diff(project: Path) -> str:
 
 
 def _head_exists(project: Path) -> bool:
+    return _rev_exists(project, "HEAD")
+
+
+def _rev_exists(project: Path, rev: str) -> bool:
+    if not str(rev).strip():
+        return False
     result = subprocess.run(
-        ["git", "rev-parse", "--verify", "--quiet", "HEAD"],
+        ["git", "rev-parse", "--verify", "--quiet", rev],
         cwd=project,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
