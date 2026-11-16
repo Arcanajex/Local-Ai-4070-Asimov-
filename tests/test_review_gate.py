@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import subprocess
-import sys
 from pathlib import Path
 
 from local_agent.client import ChatResult, ToolCall
@@ -21,6 +20,7 @@ from local_agent.review_gate import (
     decide_review,
     parse_test_counts,
 )
+from local_agent.shells import command_fails, command_succeeds, python_shell
 
 MARKER = "using Xunit;\nclass ObjLoader {}\n"
 
@@ -172,13 +172,13 @@ def test_review_verify_only_pass_resolution(tmp_path):
 def test_verify_only_fix_with_green_checks_passes(tmp_path):
     project = _repo(tmp_path / "repo")
     seen: list[str] = []
-    count = f"{sys.executable} -c \"print('46 passed in 0.01s')\" #"
+    count = python_shell("-c", "print('46 passed in 0.01s')")
     result = _run(
         tmp_path,
         project,
         "---\n"
         f"test_command: {count}\n"
-        "smoke_command: true\n"
+        f"smoke_command: {command_succeeds()}\n"
         "must_exist:\n"
         "  - marker.txt\n"
         "---\n" + _body("marker"),
@@ -212,7 +212,7 @@ def test_verify_only_fix_with_a_failing_check_still_fixes(tmp_path):
     result = _run(
         tmp_path,
         project,
-        "---\ntest_command: false\n---\n" + _body("marker"),
+        f"---\ntest_command: {command_fails()}\n---\n" + _body("marker"),
         VERIFY_REVIEW,
         [],
         max_iterations=1,
@@ -229,7 +229,7 @@ def test_mixed_defect_and_verify_still_fixes(tmp_path):
     result = _run(
         tmp_path,
         project,
-        "---\ntest_command: true\n---\n" + _body("marker"),
+        f"---\ntest_command: {command_succeeds()}\n---\n" + _body("marker"),
         MIXED_REVIEW,
         [],
     )
@@ -245,7 +245,7 @@ def test_false_missing_claim_contradicted_by_the_tree_is_dropped(tmp_path):
     result = _run(
         tmp_path,
         project,
-        "---\ntest_command: true\n---\n" + _body("marker"),
+        f"---\ntest_command: {command_succeeds()}\n---\n" + _body("marker"),
         MISSING_REVIEW,
         [],
     )
@@ -263,7 +263,7 @@ def test_task_can_disable_verify_only_pass(tmp_path):
     result = _run(
         tmp_path,
         project,
-        "---\ntest_command: true\nreview_verify_only_pass: false\n---\n" + _body("marker"),
+        f"---\ntest_command: {command_succeeds()}\nreview_verify_only_pass: false\n---\n" + _body("marker"),
         VERIFY_REVIEW,
         [],
     )

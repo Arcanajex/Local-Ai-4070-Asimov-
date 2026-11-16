@@ -18,6 +18,7 @@ from local_agent.project_context import (
 )
 from local_agent.prompts import system_prompt
 from local_agent.queue import run_queue
+from local_agent.shells import command_succeeds
 from local_agent.taskcheck import review_problems, validate_task
 
 
@@ -209,7 +210,7 @@ def test_context_reaches_every_phase_and_reports_stay_uncommitted(tmp_path):
     task_path = tmp_path / "task.md"
     task_path.write_text(
         "---\n"
-        "test_command: true\n"
+        f"test_command: {command_succeeds()}\n"
         "context:\n"
         "  - notes.md\n"
         "---\n"
@@ -280,7 +281,7 @@ def test_not_met_review_triggers_one_fix_then_can_pass(tmp_path):
     project = _repo(tmp_path / "repo")
     task_path = tmp_path / "task.md"
     task_path.write_text(
-        "---\ntest_command: true\n---\n" + _valid("fix me"),
+        f"---\ntest_command: {command_succeeds()}\n---\n" + _valid("fix me"),
         encoding="utf-8",
     )
     reviews = {"n": 0}

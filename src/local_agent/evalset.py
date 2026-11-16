@@ -24,6 +24,7 @@ from typing import Any
 
 from local_agent.overnight import load_task
 from local_agent.paths import repo_root, runtime_dir
+from local_agent.shells import SHELL_SKIP_CODE, SHELL_SKIP_STATUS
 from local_agent.taskcheck import validate_task
 
 
@@ -58,15 +59,18 @@ class Scoreboard:
 
     @property
     def ok(self) -> bool:
-        return bool(self.results) and all(item.get("status") == "pass" for item in self.results)
+        # A fixture that cannot run here (no POSIX shell) is not a failure.
+        return bool(self.results) and all(_is_ok_status(item.get("status")) for item in self.results)
 
     def summary(self) -> dict[str, Any]:
         passed = sum(1 for item in self.results if item.get("status") == "pass")
+        skipped = sum(1 for item in self.results if _is_skipped(item.get("status")))
         return {
             "mode": self.mode,
             "profile": self.profile,
             "passed": passed,
-            "failed": len(self.results) - passed,
+            "skipped": skipped,
+            "failed": len(self.results) - passed - skipped,
             "ok": self.ok,
             "scoreboard": str(self.path) if self.path else None,
             "results": self.results,
@@ -143,6 +147,8 @@ def _mock_fixture(fixture: Fixture) -> dict[str, Any]:
         if problems:
             return _row(fixture.name, "fail", 0, "task does not validate: " + "; ".join(problems))
         starter_code, starter_out = _run_checker(fixture.checker, starter)
+        if _is_shell_skip(starter_code, starter_out):
+            return _row(fixture.name, SHELL_SKIP_STATUS, 0, SHELL_SKIP_STATUS)
         if starter_code == 0:
             return _row(fixture.name, "fail", 0, "checker passed on the starter:\n" + starter_out)
         if not fixture.solution.is_dir():
@@ -173,6 +179,9 @@ def _live_fixture(
     project = base / "project"
     try:
         _copy_tree(fixture.starter, project)
+        probe_code, probe_out = _run_checker(fixture.checker, project)
+        if _is_shell_skip(probe_code, probe_out):
+            return _row(fixture.name, SHELL_SKIP_STATUS, 0, SHELL_SKIP_STATUS)
         _git_init(project)
         profile = get_profile(profile_name)
         task = load_task(fixture.task_path)
@@ -214,6 +223,19 @@ def _live_fixture(
         )
     finally:
         shutil.rmtree(base, ignore_errors=True)
+
+
+def _is_skipped(status: object) -> bool:
+    return str(status or "").startswith("skipped")
+
+
+def _is_ok_status(status: object) -> bool:
+    return status == "pass" or _is_skipped(status)
+
+
+def _is_shell_skip(code: int, output: str) -> bool:
+    text = (output or "").strip()
+    return code == SHELL_SKIP_CODE or text == SHELL_SKIP_STATUS or text.startswith(SHELL_SKIP_STATUS)
 
 
 def _row(
@@ -296,6 +318,7 @@ def _write_scoreboard(board: Scoreboard, output_dir: Path | None) -> Path:
         "",
         f"- Profile: {board.profile}",
         f"- Passed: {payload['passed']}",
+        f"- Skipped: {payload['skipped']}",
         f"- Failed: {payload['failed']}",
         "",
         "| Fixture | Status | Attempts | Wall | Detail |",

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import subprocess
-import sys
 from pathlib import Path
 
 from local_agent.client import ChatResult, ToolCall
@@ -26,6 +25,7 @@ from local_agent.logging_util import RunLogger
 from local_agent.overnight import load_task, parse_task, run_overnight, working_tree_diff
 from local_agent.paths import repo_root
 from local_agent.prompts import review_fix_prompt, review_format_reminder
+from local_agent.shells import command_succeeds, python_shell
 from local_agent.taskcheck import review_form_problems, validate_task
 from local_agent.tools import Workspace
 
@@ -66,7 +66,7 @@ def test_malformed_review_is_reprompted_and_never_starts_review_fix(tmp_path):
             return _text("1. Create marker.txt")
 
     result = run_overnight(
-        task=_task(tmp_path, "---\ntest_command: true\n---\n" + _body("marker")),
+        task=_task(tmp_path, f"---\ntest_command: {command_succeeds()}\n---\n" + _body("marker")),
         project=project,
         profile=_day(),
         client=Client(),
@@ -105,7 +105,7 @@ def test_a_reprompted_review_can_still_reject_for_real(tmp_path):
             return _text("1. Create marker.txt")
 
     result = run_overnight(
-        task=_task(tmp_path, "---\ntest_command: true\n---\n" + _body("marker")),
+        task=_task(tmp_path, f"---\ntest_command: {command_succeeds()}\n---\n" + _body("marker")),
         project=project,
         profile=_day(),
         client=Client(),
@@ -154,7 +154,7 @@ def test_empty_diff_and_turn_budget_do_not_count_as_success(tmp_path):
         task=_task(
             tmp_path,
             "---\n"
-            f"test_command: {sys.executable} -m pytest -q\n"
+            f"test_command: {python_shell('-m', 'pytest', '-q')}\n"
             "---\n" + _body("feature"),
         ),
         project=project,
@@ -185,7 +185,7 @@ def test_empty_diff_and_turn_budget_do_not_count_as_success(tmp_path):
             return _text(plan)
 
     stuck = run_overnight(
-        task=_task(tmp_path, "---\ntest_command: true\n---\n" + _body("stuck")),
+        task=_task(tmp_path, f"---\ntest_command: {command_succeeds()}\n---\n" + _body("stuck")),
         project=project2,
         profile=_day(),
         client=Stuck(),
@@ -236,7 +236,7 @@ def test_turn_budget_after_real_files_goes_to_review_without_looping(tmp_path):
                 if self.impl == 2:
                     return _call(
                         "shell",
-                        {"command": "git add feature.py && git commit -m 'add feature'"},
+                        {"command": "git add feature.py; git commit -m 'add feature'"},
                     )
                 return _call("read", {"path": "feature.py"})
             return _text(plan)
@@ -245,7 +245,7 @@ def test_turn_budget_after_real_files_goes_to_review_without_looping(tmp_path):
         task=_task(
             tmp_path,
             "---\n"
-            "test_command: true\n"
+            f"test_command: {command_succeeds()}\n"
             "must_exist:\n"
             "  - feature.py\n"
             "---\n" + _body("feature"),
@@ -309,7 +309,10 @@ def test_uncommitted_turn_budget_does_not_need_a_noop_fix(tmp_path):
             return _text(plan)
 
     result = run_overnight(
-        task=_task(tmp_path, "---\ntest_command: true\nmust_exist:\n  - feature.py\n---\n" + _body("plain")),
+        task=_task(
+            tmp_path,
+            f"---\ntest_command: {command_succeeds()}\nmust_exist:\n  - feature.py\n---\n" + _body("plain"),
+        ),
         project=project,
         profile=_day(),
         client=Client(),
@@ -352,7 +355,7 @@ def test_two_noop_fix_rounds_release_the_guard_and_review(tmp_path):
     subprocess.run(["git", "add", "README.md"], cwd=project, check=True)
     subprocess.run(["git", "commit", "-m", "notes"], cwd=project, check=True, stdout=subprocess.DEVNULL)
     result = run_overnight(
-        task=_task(tmp_path, "---\ntest_command: true\n---\n" + _body("stuck-loop")),
+        task=_task(tmp_path, f"---\ntest_command: {command_succeeds()}\n---\n" + _body("stuck-loop")),
         project=project,
         profile=_day(),
         client=Client(),
@@ -396,7 +399,7 @@ def test_must_exist_blocks_a_green_test_command(tmp_path):
     result = run_overnight(
         task=_task(
             tmp_path,
-            "---\ntest_command: true\nmust_exist:\n  - feature.py\n---\n" + _body("gate"),
+            f"---\ntest_command: {command_succeeds()}\nmust_exist:\n  - feature.py\n---\n" + _body("gate"),
         ),
         project=project,
         profile=_day(),
@@ -501,7 +504,9 @@ def test_cheat_sheet_is_in_the_system_prompt_and_repeated_on_api_errors(tmp_path
     task = _task(
         tmp_path,
         "---\n"
-        f"test_command: {sys.executable} -c \"import sys; print('error CS1061'); sys.exit(1)\"\n"
+        "test_command: "
+        + python_shell("-c", "import sys; print('error CS1061'); sys.exit(1)")
+        + "\n"
         "---\n" + _body("sheet"),
     )
     # The implement write is skipped: the test command fails, so the fix
@@ -547,7 +552,7 @@ def test_review_fix_revert_keeps_the_passing_snapshot(tmp_path):
     )
     subprocess.run(["git", "add", "check.py"], cwd=project, check=True)
     subprocess.run(["git", "commit", "-m", "check"], cwd=project, check=True, stdout=subprocess.DEVNULL)
-    command = f"{sys.executable} check.py"
+    command = python_shell("check.py")
     wrote = {"fix": 0, "impl": 0}
 
     class Client:
@@ -608,14 +613,17 @@ def test_front_matter_turn_budgets_bom_and_unparsed_front_matter(tmp_path):
     subprocess.run(["git", "add", "package.json"], cwd=project, check=True)
     subprocess.run(["git", "commit", "-m", "pkg"], cwd=project, check=True, stdout=subprocess.DEVNULL)
     body = _body("budget")
-    text = "---\nplan_turns: 3\nimplement_turns: 4\nexploration_cap: 2\ntest_command: true\n---\n" + body
+    text = (
+        "---\nplan_turns: 3\nimplement_turns: 4\nexploration_cap: 2\n"
+        f"test_command: {command_succeeds()}\n---\n" + body
+    )
     task_path = tmp_path / "task.md"
     task_path.write_bytes(b"\xef\xbb\xbf" + text.encode("utf-8"))
     loaded = load_task(task_path)
     assert loaded.front_matter_error is None
     assert loaded.plan_turns == 3
     assert loaded.implement_turns == 4
-    assert loaded.test_command == "true"
+    assert loaded.test_command == command_succeeds()
     assert validate_task(loaded, project) == []
 
     wrote = {"n": 0}

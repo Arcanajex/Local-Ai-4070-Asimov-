@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import sys
-
+from local_agent.shells import python_shell
 from local_agent.tools import Workspace, blocked_command_reason, tool_schemas
 
 
@@ -58,7 +57,7 @@ def test_paths_cannot_escape_the_project(tmp_path):
 
 def test_shell_timeout_kills_a_blocking_command(tmp_path):
     workspace = Workspace(tmp_path)
-    command = f"{sys.executable} -c \"import time; time.sleep(30)\""
+    command = python_shell("-c", "import time; time.sleep(30)")
     result = workspace.shell(command, timeout_seconds=1)
     assert not result.ok
     assert "timed_out: true" in result.output

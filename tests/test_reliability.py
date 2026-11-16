@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import subprocess
-import sys
 from pathlib import Path
 
 from local_agent.cli import main
@@ -21,6 +20,7 @@ from local_agent.overnight import (
     run_with_retries,
 )
 from local_agent.repo_map import build_repo_map
+from local_agent.shells import command_fails, command_succeeds, find_posix_shell, python_shell
 from local_agent.smoke_gate import run_smoke
 from local_agent.taskcheck import review_problems, validate_task, validate_task_warnings
 from local_agent.test_first import classify_test_run, is_test_path
@@ -42,22 +42,22 @@ def test_is_test_path_and_failure_classification():
 
 def test_smoke_run_fails_on_exit_and_traceback_and_launch_stays_up(tmp_path):
     (tmp_path / "crash.py").write_text("import sys\nsys.exit(3)\n", encoding="utf-8")
-    crash = run_smoke(f'"{sys.executable}" crash.py', cwd=tmp_path, mode="run", timeout=15)
+    crash = run_smoke(python_shell("crash.py"), cwd=tmp_path, mode="run", timeout=15)
     assert crash.ran and not crash.ok and crash.reason == "exit"
 
     (tmp_path / "tb.py").write_text(
         "import traceback\ntry:\n    raise RuntimeError('x')\nexcept Exception:\n    traceback.print_exc()\n",
         encoding="utf-8",
     )
-    quiet = run_smoke(f'"{sys.executable}" tb.py', cwd=tmp_path, mode="run", timeout=15)
+    quiet = run_smoke(python_shell("tb.py"), cwd=tmp_path, mode="run", timeout=15)
     assert not quiet.ok and quiet.reason == "traceback"
 
     (tmp_path / "sleep.py").write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
-    held = run_smoke(f'"{sys.executable}" sleep.py', cwd=tmp_path, mode="launch", launch_seconds=1)
+    held = run_smoke(python_shell("sleep.py"), cwd=tmp_path, mode="launch", launch_seconds=1)
     assert held.ok and held.reason == "passed"
 
     (tmp_path / "early.py").write_text("raise SystemExit(0)\n", encoding="utf-8")
-    early = run_smoke(f'"{sys.executable}" early.py', cwd=tmp_path, mode="launch", launch_seconds=3)
+    early = run_smoke(python_shell("early.py"), cwd=tmp_path, mode="launch", launch_seconds=3)
     assert not early.ok and early.reason == "exited_early"
 
     skipped = run_smoke("", cwd=tmp_path)
@@ -71,7 +71,7 @@ def test_launch_traceback_fails_even_if_the_process_keeps_running(tmp_path):
         "time.sleep(30)\n",
         encoding="utf-8",
     )
-    result = run_smoke(f'"{sys.executable}" boom.py', cwd=tmp_path, mode="launch", launch_seconds=2)
+    result = run_smoke(python_shell("boom.py"), cwd=tmp_path, mode="launch", launch_seconds=2)
     assert not result.ok
     assert result.reason == "traceback"
     assert "boom" in result.output
@@ -88,8 +88,8 @@ def test_smoke_failure_is_handed_to_the_fix_phase(tmp_path):
     )
     task = parse_task(
         "---\n"
-        "test_command: true\n"
-        "smoke_command: false\n"
+        f"test_command: {command_succeeds()}\n"
+        f"smoke_command: {command_fails()}\n"
         "smoke_mode: run\n"
         "---\n"
         "# Launch\n\n## Goal\n\nRun.\n\n## Acceptance criteria\n\n- [ ] it stays up\n\n## Out of scope\n\n- nothing\n",
@@ -217,7 +217,7 @@ def test_test_first_locks_failing_tests_and_rejects_edits(tmp_path):
         max_seconds=60,
         max_plan_turns=2,
         max_work_turns=4,
-        test_command=f"{sys.executable} -m pytest -q",
+        test_command=python_shell("-m", "pytest", "-q"),
     )
     assert result.status == "passed", result.report_path.read_text(encoding="utf-8")
     text = (project / "test_calc.py").read_text(encoding="utf-8")
@@ -273,7 +273,7 @@ def test_test_first_early_pass_warns_and_continues(tmp_path, capsys):
         max_plan_turns=1,
         max_work_turns=3,
         test_first=True,
-        test_command=f"{sys.executable} -m pytest -q",
+        test_command=python_shell("-m", "pytest", "-q"),
     )
     assert result.status == "passed"
     assert "passed before the implementation" in capsys.readouterr().err
@@ -300,7 +300,7 @@ def test_retry_starts_r2_with_the_failure_and_stop_file_blocks_it(tmp_path):
     project = _repo(tmp_path / "repo")
     _commit_check(project)
     task = parse_task(
-        f"---\ntest_command: {sys.executable} check.py\n---\n"
+        f"---\ntest_command: {python_shell('check.py')}\n---\n"
         "# Marker\n\n## Goal\n\nCreate ok.txt.\n\n## Acceptance criteria\n\n- [ ] ok.txt exists\n\n## Out of scope\n\n- none\n"
     )
 
@@ -454,10 +454,18 @@ def test_eval_mock_scoreboard(tmp_path):
     board = run_eval(mock=True, output_dir=tmp_path)
     assert board.ok, board.summary()
     assert len(board.results) == 11
+    by_name = {item["name"]: item["status"] for item in board.results}
+    shell_status = by_name["shell-script"]
+    if find_posix_shell():
+        assert shell_status == "pass", board.summary()
+    else:
+        assert shell_status == "skipped: needs sh"
+    assert all(status == "pass" or status.startswith("skipped") for status in by_name.values())
     assert board.path is not None and board.path.is_file()
     saved = json.loads(board.path.read_text(encoding="utf-8"))
     assert saved["mode"] == "mock"
-    assert saved["passed"] == 11
+    assert saved["passed"] == sum(status == "pass" for status in by_name.values())
+    assert saved["failed"] == 0
     code = main(["eval", "--mock", "--only", "default-on", "--output-dir", str(tmp_path / "cli")])
     assert code == 0
 
@@ -515,7 +523,7 @@ def _first(messages) -> str:
 
 def load_task_body():
     return parse_task(
-        "---\ntest_command: true\n---\n# Wait\n\n## Goal\n\nNothing.\n\n## Acceptance criteria\n\n- [ ] done\n\n## Out of scope\n\n- none\n"
+        f"---\ntest_command: {command_succeeds()}\n---\n# Wait\n\n## Goal\n\nNothing.\n\n## Acceptance criteria\n\n- [ ] done\n\n## Out of scope\n\n- none\n"
     )
 
 
