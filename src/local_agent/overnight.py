@@ -58,6 +58,14 @@ from local_agent.prompts import (
     test_first_prompt,
     test_first_repair_prompt,
 )
+from local_agent.review_gate import (
+    build_harness_evidence,
+    decide_review,
+    harness_checks_green,
+    is_fix_verdict,
+    must_exist_rows,
+    present_review,
+)
 from local_agent.snapshots import Snapshot, create_snapshot, restore_snapshot
 from local_agent.repo_map import build_repo_map
 from local_agent.smoke_gate import run_smoke
@@ -65,7 +73,6 @@ from local_agent.taskcheck import (
     extract_section,
     format_problems,
     review_form_problems,
-    review_problems,
     validate_task,
 )
 from local_agent.test_first import (
@@ -128,6 +135,9 @@ class TaskSpec:
     blocked_probes: list[str] = field(default_factory=list)
     api_error_patterns: list[str] = field(default_factory=list)
     scratch_dirs: list[str] = field(default_factory=list)
+    # None means the task did not set it. The profile default (true) applies,
+    # unless AGENTS.md front matter sets the key.
+    review_verify_only_pass: bool | None = None
     front_matter_error: str | None = None
 
 
@@ -188,6 +198,7 @@ def parse_task(text: str, path: Path | None = None) -> TaskSpec:
         blocked_probes=lists.get("blocked_probes", []),
         api_error_patterns=lists.get("api_error_patterns", []),
         scratch_dirs=lists.get("scratch_dirs", []),
+        review_verify_only_pass=_optional_bool(meta, "review_verify_only_pass"),
         front_matter_error=error,
     )
 
@@ -277,6 +288,25 @@ def _optional_int(meta: dict[str, str], key: str) -> int | None:
         return None
 
 
+def _optional_bool(meta: dict[str, str], key: str) -> bool | None:
+    if key not in meta or str(meta.get(key) or "").strip() == "":
+        return None
+    return _truthy(meta[key])
+
+
+def review_verify_only_enabled(task: TaskSpec, profile: Profile) -> bool:
+    """Task front matter, then AGENTS.md, then the profile. Default true.
+
+    `apply_project_defaults` copies the AGENTS.md value onto the task when
+    the task left the key unset, so this only has to prefer the task over
+    the profile.
+    """
+
+    if task.review_verify_only_pass is not None:
+        return bool(task.review_verify_only_pass)
+    return bool(getattr(profile, "review_verify_only_pass", True))
+
+
 def agents_front_matter(project: Path) -> dict[str, str]:
     """Front matter of the target repo's AGENTS.md, or {} when it has none."""
 
@@ -324,6 +354,8 @@ def apply_project_defaults(task: TaskSpec, project: Path) -> TaskSpec:
         task.exploration_bonus_turns = _optional_int(meta, "exploration_bonus_turns")
     if not task.cheat_sheet_marker and meta.get("cheat_sheet_marker"):
         task.cheat_sheet_marker = meta["cheat_sheet_marker"]
+    if task.review_verify_only_pass is None and "review_verify_only_pass" in meta:
+        task.review_verify_only_pass = _optional_bool(meta, "review_verify_only_pass")
     return task
 
 
@@ -837,6 +869,9 @@ def _review_and_maybe_fix(
         test_first_files=test_first_files,
         smoke_passed=None if not smoke_ran else smoke_passed,
         base=base,
+        test_output=test_output,
+        test_command=test_command,
+        lint_command=lint_command,
     )
     if malformed:
         logger.event("review_unusable", summary="malformed review was not sent to review-fix")
@@ -901,6 +936,9 @@ def _review_and_maybe_fix(
         test_first_files=test_first_files,
         smoke_passed=None if not smoke_ran else smoke_passed,
         base=base,
+        test_output=test_output,
+        test_command=test_command,
+        lint_command=lint_command,
     )
     if malformed:
         logger.event("review_unusable", summary="second review was malformed and was not sent to another fix")
@@ -926,16 +964,32 @@ def _one_review(
     test_first_files: str = "",
     smoke_passed: bool | None = None,
     base: str = "",
+    test_output: str = "",
+    test_command: str = "",
+    lint_command: str | None = None,
 ) -> tuple[str, list[str], bool]:
     """Returns review text, substantive problems, and whether the reply is unusable.
 
     Up to two re-prompts. A still-malformed reply is not a rejection.
+    A fix vote that only asks to re-check a green harness result is not a
+    rejection either, when review_verify_only_pass is on.
     """
 
     require_coverage = bool(test_first_files.strip())
     reminder = ""
     text = ""
     plain_guard = PhaseGuard(expect_plain_text=True, plain_text_retries=0, exploration_cap=0)
+    evidence = build_harness_evidence(
+        workspace.root,
+        test_command=test_command or task.test_command,
+        lint_command=lint_command if lint_command is not None else task.lint_command,
+        tests_passed=tests_passed,
+        test_output=test_output,
+        must_exist=task.must_exist,
+        smoke_passed=smoke_passed,
+        smoke_command=task.smoke_command,
+        changed_files=changed_files_since(workspace.root, base),
+    )
     for attempt in range(3):
         prompt = review_prompt(
             task.body,
@@ -945,6 +999,7 @@ def _one_review(
             out_of_scope=extract_section(task.body, "Out of scope"),
             context_block=context_block,
             test_first_files=test_first_files,
+            evidence=evidence,
         )
         if reminder:
             prompt += "\n\n" + reminder
@@ -960,9 +1015,21 @@ def _one_review(
         text = strip_leaked_tool_markup(review.content or "").strip()
         reasons = review_form_problems(text, require_test_coverage=require_coverage)
         if not reasons:
+            text, problems = _apply_review_policy(
+                text,
+                project=workspace.root,
+                logger=logger,
+                phase=phase,
+                tests_passed=tests_passed,
+                smoke_passed=smoke_passed,
+                test_output=test_output,
+                must_exist=task.must_exist,
+                allow_verify_only_pass=review_verify_only_enabled(task, profile),
+                require_test_coverage=require_coverage,
+            )
             if smoke_passed is False and "smoke" not in text.lower():
                 text = text + "\n\nSmoke: the smoke command did not pass.\n"
-            return text, review_problems(text, require_test_coverage=require_coverage), False
+            return text, problems, False
         if attempt == 2:
             break
         logger.event(
@@ -974,6 +1041,55 @@ def _one_review(
         )
         reminder = review_format_reminder()
     return text, [], True
+
+
+def _apply_review_policy(
+    text: str,
+    *,
+    project: Path,
+    logger: RunLogger,
+    phase: str,
+    tests_passed: bool,
+    smoke_passed: bool | None,
+    test_output: str,
+    must_exist: list[str],
+    allow_verify_only_pass: bool,
+    require_test_coverage: bool,
+) -> tuple[str, list[str]]:
+    """Turn a verify-only fix vote into a pass, and drop contradicted findings."""
+
+    _rows, must_missing = must_exist_rows(project, must_exist, test_output)
+    green = harness_checks_green(
+        tests_passed=tests_passed,
+        smoke_passed=smoke_passed,
+        must_missing=must_missing,
+    )
+    ruling = decide_review(
+        text,
+        project,
+        checks_green=green,
+        allow_verify_only_pass=allow_verify_only_pass,
+        require_test_coverage=require_test_coverage,
+    )
+    if ruling.contradicted:
+        logger.event(
+            "review_finding_contradicted",
+            phase=phase,
+            items=ruling.contradicted,
+            summary="dropped findings contradicted by the tree: "
+            + "; ".join(ruling.contradicted)[:300],
+        )
+    if ruling.action == "pass" and ruling.verify_items and is_fix_verdict(text):
+        logger.event(
+            "review_verify_only_pass",
+            phase=phase,
+            items=ruling.verify_items,
+            tests_passed=tests_passed,
+            smoke_passed=smoke_passed,
+            must_exist_missing=must_missing,
+            summary="verify-only review treated as pass: " + "; ".join(ruling.verify_items)[:300],
+        )
+    return present_review(text, ruling), ruling.problems
 
 
 def _run_phase(
@@ -1643,6 +1759,40 @@ def _config_get(project: Path, key: str) -> str:
 # Cap one new file so a generated log cannot push every other file out of the
 # review prompt. The whole diff is capped again before it is sent.
 _NEW_FILE_CHARS = 12_000
+
+
+def changed_files_since(project: Path, base: str | None = None) -> list[str]:
+    """Paths changed against the task base, including untracked files.
+
+    `git diff --name-only` misses files that were never staged. The review
+    prompt lists those too, because that is the change the model has to judge.
+    """
+
+    revision = (base or "").strip() or "HEAD"
+    names: list[str] = []
+    seen: set[str] = set()
+
+    def add(name: str) -> None:
+        rel = name.strip().replace("\\", "/")
+        if not rel or rel in seen:
+            return
+        seen.add(rel)
+        names.append(rel)
+
+    if _rev_exists(project, revision):
+        try:
+            listed = _git(project, "diff", "--name-only", "--relative", revision)
+        except RuntimeError:
+            listed = ""
+        for line in listed.splitlines():
+            add(line)
+    try:
+        untracked = _git(project, "ls-files", "--others", "--exclude-standard")
+    except RuntimeError:
+        untracked = ""
+    for line in untracked.splitlines():
+        add(line)
+    return names
 
 
 def working_tree_diff(project: Path, base: str | None = None) -> str:

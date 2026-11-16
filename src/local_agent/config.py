@@ -47,6 +47,7 @@ OVERRIDABLE = {
     "cheat_sheet_markers",
     "extra_probe_patterns",
     "extra_scratch_markers",
+    "review_verify_only_pass",
 }
 
 
@@ -111,6 +112,11 @@ class Profile:
     cheat_sheet_markers: list[str] = field(default_factory=list)
     extra_probe_patterns: list[str] = field(default_factory=list)
     extra_scratch_markers: list[str] = field(default_factory=list)
+    # A fix vote whose open items only ask to re-run checks the harness
+    # already passed is accepted. A task or AGENTS.md key of the same name
+    # overrides this. The default stays on so an existing profile does not
+    # have to set it.
+    review_verify_only_pass: bool = True
 
     @property
     def offload_flag(self) -> str:
@@ -264,6 +270,7 @@ def profile_from_dict(name: str, data: dict[str, Any], defaults: dict[str, Any])
         cheat_sheet_markers=_as_str_list(merged.get("cheat_sheet_markers")),
         extra_probe_patterns=_as_str_list(merged.get("extra_probe_patterns")),
         extra_scratch_markers=_as_str_list(merged.get("extra_scratch_markers")),
+        review_verify_only_pass=_as_bool(merged.get("review_verify_only_pass", True)),
     )
 
 

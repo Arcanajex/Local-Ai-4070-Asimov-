@@ -141,6 +141,7 @@ def review_prompt(
     out_of_scope: str = "",
     context_block: str = "",
     test_first_files: str = "",
+    evidence: str = "",
 ) -> str:
     status = "The test command passed." if tests_ok else "The test command did not pass."
     context = (context_block.rstrip() + "\n\n") if context_block.strip() else ""
@@ -158,9 +159,20 @@ def review_prompt(
             "\n\nLOCKED TEST-FIRST FILES (these must still match the criteria and "
             f"must not have been weakened):\n{test_first_files.strip()}\n"
         )
+    evidence_block = ""
+    authority = ""
+    if evidence.strip():
+        authority = (
+            "The harness checks below were executed by the harness and are authoritative. "
+            "Do not request running, verifying, checking, or confirming anything those "
+            "checks already cover. Do not claim a file, import, or symbol is missing when "
+            "the changed-file contents show it.\n"
+        )
+        evidence_block = evidence.strip() + "\n\n"
     return (
         f"{context}"
         "Review the diff against the task and the project context. Do not call tools.\n"
+        f"{authority}"
         "Reply with these sections and these exact headings:\n"
         "Acceptance criteria:\n"
         "one line per criterion, each ending in met or not met.\n"
@@ -169,12 +181,19 @@ def review_prompt(
         "Conflicts with AGENTS.md or decisions:\n"
         "each conflict, or none.\n"
         f"{coverage}"
+        "Findings:\n"
+        "one line per leftover item, or none. Start each item with [defect] or [verify-only]. "
+        "[verify-only] means the item only asks to run, verify, check, or confirm. "
+        "[defect] means wrong behaviour, a file or symbol that is not in the tree, "
+        "or a criterion that is not met.\n"
         "Correctness: what the change does and whether it matches the task.\n"
         "Tests: what was verified and what was not.\n"
         "Risks: concrete leftover bugs or edge cases.\n"
-        "Verdict: accept or fix. Use fix only for a defect you can point at in the diff.\n"
+        "Verdict: accept or fix. Use fix only when at least one finding is a [defect]. "
+        "Do not vote fix for a [verify-only] item the harness checks already cover.\n"
         "Open questions: unresolved ambiguities, or none. Do not guess.\n\n"
         f"{status}\n\n"
+        f"{evidence_block}"
         f"ACCEPTANCE CRITERIA FROM THE TASK:\n{acceptance or '(none listed)'}\n\n"
         f"OUT OF SCOPE FROM THE TASK:\n{out_of_scope or '(none listed)'}\n"
         f"{locked}\n"
@@ -190,8 +209,11 @@ def review_format_reminder() -> str:
     return (
         "Your previous reply was not a usable review. This phase has no tools. "
         "Do not emit <tool_call> tags, </tool_call> tags, or any other tool markup. "
-        "Write the review from the diff and the project context already in this prompt. "
-        "Do not ask to read files. Use these exact headings, each on its own line:\n"
+        "Write the review from the diff, the harness checks, and the project context "
+        "already in this prompt. Those checks were executed by the harness and are "
+        "authoritative. Do not ask to run, verify, check, or confirm them, and do not "
+        "claim a file or symbol is missing when the prompt shows it. "
+        "Use these exact headings, each on its own line:\n"
         "Acceptance criteria:\n"
         "Out-of-scope files touched:\n"
         "Conflicts with AGENTS.md or decisions:\n"
