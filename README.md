@@ -328,6 +328,8 @@ Optional front matter, all unset by default except the turn budgets and the expl
 | `verify_timeout` | 120 | Seconds for each verify command. Clamped to 1–600. |
 | `extract_verify_commands` | `false` | When `true`, also run backtick-quoted commands found in Acceptance criteria. Off unless the task, `AGENTS.md`, or the profile sets it, because a guessed command is easy to get wrong. Flag fragments such as `` `--frames 60` `` are not extracted. |
 | `review_verify_only_pass` | `true` | Accept a review that votes `accept` or `fix` when every open item only asks to run or verify a check the harness already passed. A `not met` or `unverified` line whose only reason is that the harness did not run the check counts as one of those items. A real defect still starts review-fix. Set `false` on the task, in `AGENTS.md`, or on the profile to keep that vote as review-fix. |
+| `repo_map` | `true` | Build a symbol index of the target repo and put it in the plan and implement context. Set `false` to turn it off. |
+| `repo_map_tokens` | `4000` | Token budget for that index (about 4 characters per token). Clamped to 200–6000. |
 
 The same numeric keys can sit on the profile in `profiles\models.json` or under that profile in `runtime\overrides.json`. A value in the task file wins over the profile. Passing an explicit turn budget to the Python function (the tests and the eval runner do this) wins over the task file. See [docs/TASK_TEMPLATE.md](docs/TASK_TEMPLATE.md).
 
@@ -340,7 +342,13 @@ Logs:
 
 ## Project context and the task template
 
-The target repo should have an `AGENTS.md` at its root. That file, plus any paths named in a task's `context:` front matter, is inlined as a **Project context** block at the start of every phase (plan, implement, fix, review). The block is capped at 14,000 characters. A short Python repo map (modules, classes, functions, about 6,000 characters) is appended when the tree has Python files. When a file is cut, the block says `[truncated - read <path> for the rest]` and still lists every path so the model can read the remainder. Compaction keeps the first user message, so this block is not dropped when tool output is trimmed. The prompt itself is capped at 32,768 estimated tokens even though the quality context is 65,536, so the completion still has room.
+The target repo should have an `AGENTS.md` at its root. That file, plus any paths named in a task's `context:` front matter, is inlined as a **Project context** block at the start of every phase (plan, implement, fix, review). The block is capped at 14,000 characters. When a file is cut, the block keeps sections that match the task or a cheat-sheet heading, says which headings were omitted, and still says `[truncated - read <path> for the rest]`. Every path stays in the list so the model can read the remainder. A truncation is also written to `events.log` as `project_context_truncated`.
+
+A **repo map** is appended after that block, in its own budget, so it does not steal characters from `AGENTS.md`. It lists files and their symbols (C# namespaces, classes, methods, and fields, plus Python, with a short fallback for other source files). `bin/`, `obj/`, `.git`, build output, vendored directories, and `.gitignore` matches are skipped. Files mentioned by the task, named in the plan, changed recently, or referenced by those files are ranked first. The default budget is 4,000 tokens (about 16,000 characters). Set `repo_map: false` or `repo_map_tokens` on the task, in `AGENTS.md`, or on the profile (`runtime\overrides.json`). The task wins, then `AGENTS.md`, then the profile. The map is rebuilt before each later phase so new symbols show up, and it stays in the first user message only, which compaction keeps. Its size is logged as `repo map N chars`.
+
+`list_files` lists a directory with the same skips. A recursive `Get-ChildItem -Recurse`, `ls -R`, or `find` is answered the same way instead of walking `bin/` and `obj/`.
+
+Compaction keeps the first user message, so the project context and the one repo map are not dropped when tool output is trimmed. The prompt itself is capped at 32,768 estimated tokens even though the quality context is 65,536, so the completion still has room.
 
 Write tasks with [docs/TASK_TEMPLATE.md](docs/TASK_TEMPLATE.md). Required headings are `Goal`, `Acceptance criteria`, and `Out of scope`. A non-Python repo must set `test_command`. A Python repo that omits it uses `python -m pytest -q`.
 

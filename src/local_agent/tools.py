@@ -1,4 +1,4 @@
-"""The four tools local models actually complete: read, write, edit, shell.
+"""The tools local models actually complete: read, list_files, write, edit, shell.
 
 Schemas stay flat on purpose. Nested JSON and large optional objects are
 where  the 8GB bench saw tool-call failures. The shell always has a timeout
@@ -14,6 +14,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from local_agent.repo_map import format_file_list
 
 MAX_READ_LINES = 400
 MAX_WRITE_BYTES = 1_000_000
@@ -78,6 +80,27 @@ def tool_schemas(allowed: set[str] | None = None) -> list[dict[str, Any]]:
                 },
             },
         },
+        "list_files": {
+            "type": "function",
+            "function": {
+                "name": "list_files",
+                "description": (
+                    "List files under a project directory. Skips bin, obj, .git, "
+                    "build output, vendored directories, and paths ignored by .gitignore. "
+                    "Paths are relative to the project root."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Directory relative to the project root. Use . for the root.",
+                        },
+                    },
+                    "required": ["path"],
+                },
+            },
+        },
         "write": {
             "type": "function",
             "function": {
@@ -128,7 +151,7 @@ def tool_schemas(allowed: set[str] | None = None) -> list[dict[str, Any]]:
             },
         },
     }
-    names = ["read", "write", "edit", "shell"]
+    names = ["read", "list_files", "write", "edit", "shell"]
     if allowed is not None:
         names = [name for name in names if name in allowed]
     return [specs[name] for name in names]
@@ -178,6 +201,23 @@ class Workspace:
         if start - 1 + count < len(lines):
             body += "\n[file continues; read again with a higher offset]"
         return ToolResult(True, header + "\n" + body)
+
+    def list_files(self, path: str) -> ToolResult:
+        raw = path if isinstance(path, str) and path.strip() else "."
+        try:
+            target = self.resolve(raw)
+        except ValueError as exc:
+            return ToolResult(False, str(exc))
+        if target.exists() and target.is_dir():
+            rel = target.relative_to(self.root).as_posix()
+            listed = "." if rel == "." else rel
+        elif not target.exists():
+            return ToolResult(False, f"path not found: {raw}")
+        else:
+            listed = target.relative_to(self.root).as_posix()
+        text = format_file_list(self.root, listed)
+        ok = not text.startswith("path not found") and not text.startswith("path escapes")
+        return ToolResult(ok, text)
 
     def lock_files(self, rels: list[str]) -> list[str]:
         """Remember the current bytes of these project-relative paths."""
@@ -288,6 +328,16 @@ class Workspace:
         blocked = blocked_command_reason(command)
         if blocked:
             return ToolResult(False, blocked)
+        listed = recursive_listing_directory(command)
+        if listed is not None:
+            text = format_file_list(self.root, listed)
+            if text.startswith("path not found") or text.startswith("path escapes"):
+                return ToolResult(False, text)
+            header = (
+                f"listed {listed} (skipped bin, obj, .git, build output, and ignored paths). "
+                "Use list_files for directory listings.\n"
+            )
+            return ToolResult(True, header + text)
         timeout = _clamp_timeout(timeout_seconds)
         return run_command(command, cwd=self.root, timeout=timeout)
 
@@ -312,6 +362,64 @@ def clear_bytecode(root: Path) -> None:
             continue
         for cached in cache.glob("*.pyc"):
             cached.unlink(missing_ok=True)
+
+
+_LIST_COMMAND = re.compile(r"(?i)^(get-childitem|gci|ls|dir|find)\b")
+_LIST_DANGER = re.compile(
+    r"[|&;<>]|\b(remove-item|rm|del|erase|mv|cp|copy|move|mkdir|ni|new-item|foreach-object)\b",
+    re.IGNORECASE,
+)
+_LIST_RECURSIVE = re.compile(
+    r"(?i)(?:^|\s)-Recurse\b|(?:^|\s)--recursive\b|(?:^|\s)-[a-zA-Z]*R[a-zA-Z]*\b|(?:^|\s)/s\b"
+)
+
+
+def recursive_listing_directory(command: str) -> str | None:
+    """Directory a pure recursive listing would walk, or None to run the shell.
+
+    `Get-ChildItem -Recurse` on a .NET tree dies in bin/ and obj/ or floods the
+    prompt. Those commands are answered with list_files instead. A pipeline,
+    a delete, or a plain `ls` still runs.
+    """
+
+    text = " ".join((command or "").strip().split())
+    if not text or _LIST_DANGER.search(text):
+        return None
+    match = _LIST_COMMAND.match(text)
+    if not match:
+        return None
+    name = match.group(1).lower()
+    if name == "find":
+        if re.search(r"(?i)-delete|-exec|-ok\b|-execdir", text):
+            return None
+    elif not _LIST_RECURSIVE.search(text):
+        return None
+    return _listing_directory(text, name)
+
+
+def _listing_directory(command: str, name: str) -> str:
+    rest = re.sub(r"(?i)^(get-childitem|gci|ls|dir|find)\s*", "", command).strip()
+    tokens = re.findall(r'"[^"]*"|\'[^\']*\'|\S+', rest)
+    positionals: list[str] = []
+    skip_next = False
+    for token in tokens:
+        if skip_next:
+            skip_next = False
+            continue
+        bare = token.strip("\"'")
+        if re.match(r"(?i)^(?:-[a-zA-Z][\w-]*|/s|/b|/a|/q)$", bare):
+            if bare.lower() in {"-name", "-filter", "-include", "-exclude"}:
+                skip_next = True
+            continue
+        positionals.append(bare)
+    if name == "find":
+        raw = positionals[0] if positionals else "."
+    else:
+        raw = positionals[0] if positionals else "."
+    raw = raw.replace("\\", "/")
+    if raw.startswith("./"):
+        raw = raw[2:]
+    return raw or "."
 
 
 def blocked_command_reason(command: str) -> str | None:
@@ -439,6 +547,8 @@ def dispatch(name: str, arguments: dict[str, Any], workspace: Workspace) -> Tool
                 offset=int(arguments.get("offset") or 1),
                 limit=int(arguments.get("limit") or MAX_READ_LINES),
             )
+        if name == "list_files":
+            return workspace.list_files(str(arguments.get("path") or "."))
         if name == "write":
             return workspace.write(arguments.get("path", ""), arguments.get("content", ""))
         if name == "edit":

@@ -81,9 +81,36 @@ def test_tripwire_blocks_push_and_shutdown_but_allows_normal_commands():
     assert blocked_command_reason("rm -rf ./build") is None
 
 
+def test_list_files_skips_bin_obj_and_ignored_paths(tmp_path):
+    workspace = Workspace(tmp_path)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "App.cs").write_text("class App {}", encoding="utf-8")
+    (tmp_path / "src" / "obj").mkdir()
+    (tmp_path / "src" / "obj" / "App.cs").write_text("class Junk {}", encoding="utf-8")
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "Out.cs").write_text("class Bin {}", encoding="utf-8")
+    (tmp_path / ".gitignore").write_text("hidden/\n", encoding="utf-8")
+    (tmp_path / "hidden").mkdir()
+    (tmp_path / "hidden" / "Secret.cs").write_text("class Secret {}", encoding="utf-8")
+    listed = workspace.list_files("src")
+    assert listed.ok
+    assert "src/App.cs" in listed.output
+    assert "Junk" not in listed.output
+    assert "src/obj" not in listed.output
+    root = workspace.list_files(".")
+    assert "src/App.cs" in root.output
+    assert "bin/Out.cs" not in root.output
+    assert "Secret" not in root.output
+    recursed = workspace.shell("Get-ChildItem src -Recurse -Name")
+    assert recursed.ok
+    assert "src/App.cs" in recursed.output
+    assert "Junk" not in recursed.output
+    assert "skipped bin" in recursed.output
+
+
 def test_tool_schemas_are_flat_and_can_be_restricted_to_read():
     names = [schema["function"]["name"] for schema in tool_schemas()]
-    assert names == ["read", "write", "edit", "shell"]
+    assert names == ["read", "list_files", "write", "edit", "shell"]
     for schema in tool_schemas():
         properties = schema["function"]["parameters"]["properties"]
         for prop in properties.values():
