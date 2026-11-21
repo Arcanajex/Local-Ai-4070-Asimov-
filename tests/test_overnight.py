@@ -46,6 +46,9 @@ def test_mock_smoke_fixes_a_bug_and_commits():
     assert "tool_result" in kinds
     assert "tests" in kinds
     assert "phase_start" in kinds
+    text_log = (result.log_dir / "events.log").read_text(encoding="utf-8")
+    assert "step_start 1/" in text_log
+    assert "step_pass 1/" in text_log
     subject = subprocess.check_output(
         ["git", "log", "-1", "--format=%s"], cwd=project, text=True
     ).strip()

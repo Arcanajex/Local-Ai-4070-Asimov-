@@ -51,6 +51,10 @@ OVERRIDABLE = {
     "extract_verify_commands",
     "repo_map",
     "repo_map_tokens",
+    "steps",
+    "max_steps",
+    "step_turns",
+    "step_replans",
 }
 
 
@@ -127,6 +131,15 @@ class Profile:
     # 4 characters each. 4000 sits in the 3–6k band; the resolver caps at 6000.
     repo_map: bool = True
     repo_map_tokens: int = 4000
+    # After the plan, split the work into small checked steps. On by default:
+    # one 30-turn implement phase was hitting the turn budget and rewriting
+    # large files in a single shot. A reply that is not a step list falls
+    # back to that single phase. Task and AGENTS.md keys of the same names
+    # override these.
+    steps: bool = True
+    max_steps: int = 6
+    step_turns: int = 12
+    step_replans: int = 1
 
     @property
     def offload_flag(self) -> str:
@@ -284,6 +297,10 @@ def profile_from_dict(name: str, data: dict[str, Any], defaults: dict[str, Any])
         extract_verify_commands=_as_bool(merged.get("extract_verify_commands", False)),
         repo_map=_as_bool(merged.get("repo_map", True)),
         repo_map_tokens=_as_int(merged.get("repo_map_tokens", 4000), "repo_map_tokens"),
+        steps=_as_bool(merged.get("steps", True)),
+        max_steps=_as_int(merged.get("max_steps", 6), "max_steps"),
+        step_turns=_as_int(merged.get("step_turns", 12), "step_turns"),
+        step_replans=_as_int(merged.get("step_replans", 1), "step_replans"),
     )
 
 

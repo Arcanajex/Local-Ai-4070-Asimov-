@@ -55,8 +55,23 @@ from local_agent.prompts import (
     review_fix_prompt,
     review_format_reminder,
     review_prompt,
+    step_breakdown_prompt,
+    step_fix_header,
+    step_implement_prompt,
+    step_replan_prompt,
     test_first_prompt,
     test_first_repair_prompt,
+)
+from local_agent.steps import (
+    STEP_ATTEMPTS,
+    STEP_FIX_ROUNDS,
+    Step,
+    StepSettings,
+    commands_match,
+    format_step_list,
+    format_steps_markdown,
+    parse_steps,
+    resolve_step_settings,
 )
 from local_agent.review_gate import (
     VerifyCommandResult,
@@ -105,6 +120,7 @@ RETRYABLE_STATUSES = {
     "review_malformed",
     "review_fix_reverted",
     "restored_snapshot",
+    "step_failed",
 }
 _LIST_KEYS = {
     "context",
@@ -159,6 +175,12 @@ class TaskSpec:
     # AGENTS.md front matter sets the key.
     repo_map: bool | None = None
     repo_map_tokens: int | None = None
+    # None means unset. Steps are on unless the task, AGENTS.md, or the profile
+    # turns them off. An unusable breakdown still falls back to one implement phase.
+    steps: bool | None = None
+    max_steps: int | None = None
+    step_turns: int | None = None
+    step_replans: int | None = None
     front_matter_error: str | None = None
 
 
@@ -227,6 +249,10 @@ def parse_task(text: str, path: Path | None = None) -> TaskSpec:
         extract_verify_commands=_optional_bool(meta, "extract_verify_commands"),
         repo_map=_optional_bool(meta, "repo_map"),
         repo_map_tokens=_optional_int(meta, "repo_map_tokens"),
+        steps=_optional_bool(meta, "steps"),
+        max_steps=_optional_int(meta, "max_steps"),
+        step_turns=_optional_int(meta, "step_turns"),
+        step_replans=_optional_int(meta, "step_replans"),
         front_matter_error=error,
     )
 
@@ -419,6 +445,14 @@ def apply_project_defaults(task: TaskSpec, project: Path) -> TaskSpec:
         task.repo_map = _optional_bool(meta, "repo_map")
     if task.repo_map_tokens is None and "repo_map_tokens" in meta:
         task.repo_map_tokens = _optional_int(meta, "repo_map_tokens")
+    if task.steps is None and "steps" in meta:
+        task.steps = _optional_bool(meta, "steps")
+    if task.max_steps is None and "max_steps" in meta:
+        task.max_steps = _optional_int(meta, "max_steps")
+    if task.step_turns is None and "step_turns" in meta:
+        task.step_turns = _optional_int(meta, "step_turns")
+    if task.step_replans is None and "step_replans" in meta:
+        task.step_replans = _optional_int(meta, "step_replans")
     return task
 
 
@@ -528,6 +562,16 @@ def run_overnight(
             profile.exploration_cap if profile.exploration_cap is not None else DEFAULT_EXPLORATION_CAP,
         )
         exploration_bonus = resolve_optional_int(task.exploration_bonus_turns, profile.exploration_bonus_turns)
+        step_settings = resolve_step_settings(
+            task.steps,
+            task.max_steps,
+            task.step_turns,
+            task.step_replans,
+            profile_enabled=profile.steps,
+            profile_max_steps=profile.max_steps,
+            profile_step_turns=profile.step_turns,
+            profile_replans=profile.step_replans,
+        )
         use_test_first = task.test_first if test_first is None else bool(test_first)
         identity_note = ensure_repository(project, init_repo=init_repo) or ""
         if identity_note:
@@ -638,6 +682,10 @@ def run_overnight(
             plan_turns=max_plan_turns,
             implement_turns=max_work_turns,
             exploration_cap=exploration_cap,
+            steps=step_settings.enabled,
+            max_steps=step_settings.max_steps,
+            step_turns=step_settings.step_turns,
+            step_replans=step_settings.replans,
             cheat_sheet_chars=len(cheat_sheet),
             summary=branch,
         )
@@ -696,15 +744,58 @@ def run_overnight(
             )
 
         context_block = refresh_context()
-        implement = _run_phase(
-            client, workspace, logger, profile,
-            with_project_context(implement_prompt(task.body, plan_text), context_block),
-            allowed=None,
-            max_turns=max_work_turns,
-            deadline=deadline,
-            phase="implement",
-            guard=work_guard,
-        )
+        step_result = StepLoopResult(enabled=step_settings.enabled)
+        if step_settings.enabled and time.monotonic() < deadline:
+            step_result = _run_step_loop(
+                client=client,
+                workspace=workspace,
+                logger=logger,
+                profile=profile,
+                task=task,
+                project=project,
+                branch=branch,
+                plan_text=plan_text,
+                context_block=context_block,
+                deadline=deadline,
+                max_plan_turns=max_plan_turns,
+                settings=step_settings,
+                work_guard=work_guard,
+                plan_guard=plan_guard,
+                snapshots=snapshots,
+                test_command=test_cmd,
+                lint_command=lint_cmd,
+                planned_state=planned_state,
+                repo_enabled=repo_enabled,
+                repo_tokens=repo_tokens,
+                outline_cache=outline_cache,
+                cheat_sheet=cheat_sheet,
+                api_patterns=api_patterns,
+                base_sha=base_sha,
+            )
+            if step_result.files:
+                work_guard = replace(
+                    work_guard,
+                    plan_paths=tuple(dict.fromkeys((*work_guard.plan_paths, *step_result.files))),
+                )
+        step_aborted = step_result.aborted
+        if step_result.engaged:
+            if step_result.timed_out:
+                implement_status = "time_budget"
+            elif step_result.aborted:
+                implement_status = "step_failed"
+            else:
+                implement_status = "completed"
+            implement = PhaseResult(implement_status, step_result.note, 0)
+        else:
+            implement = _run_phase(
+                client, workspace, logger, profile,
+                with_project_context(implement_prompt(task.body, plan_text), context_block),
+                allowed=None,
+                max_turns=max_work_turns,
+                deadline=deadline,
+                phase="implement",
+                guard=work_guard,
+            )
         tests_passed = False
         test_output = ""
         iterations = 0
@@ -745,7 +836,39 @@ def run_overnight(
                 consecutive_noop_fixes = 0
             return changed
 
+        if step_aborted:
+            if snapshots:
+                restored = _restore_last_snapshot(project, snapshots[-1], logger)
+                if restored:
+                    restored_snapshot = restored
+            note_checks(_run_iteration_checks(project, test_cmd, lint_cmd, task, logger, "step-stop"))
+            if tests_passed and smoke_passed and verify_passed:
+                gap_reason = cumulative_gap()
+                release = false_pass_release(gap_reason, implement_status=implement.status)
+                if release:
+                    reason, _accept_gap = release
+                    _log_guard(
+                        logger, "release", 0, reason, implement_status=implement.status, base=base_sha[:12]
+                    )
+                elif gap_reason:
+                    _log_guard(
+                        logger, "block", 0, gap_reason, implement_status=implement.status, base=base_sha[:12]
+                    )
+                    logger.event("false_pass", iteration=0, summary=gap_reason[:500])
+                    tests_passed = False
+                    test_output = (
+                        test_output
+                        + "\n\nFalse pass: "
+                        + gap_reason
+                        + "\nPassing tests were not counted.\n"
+                    )
+            stop_status = "step_failed"
+            if step_result.note.strip():
+                test_output = step_result.note.strip() + "\n\n" + (test_output or "")
+
         for iterations in range(1, max_iterations + 1):
+            if step_aborted:
+                break
             if time.monotonic() >= deadline:
                 stop_status = "time_budget"
                 break
@@ -875,6 +998,11 @@ def run_overnight(
         else:
             stop_status = "iteration_budget"
 
+        if step_aborted:
+            # The break above still assigns the loop variable. The step loop
+            # already ran its own checks; this is not a test iteration.
+            iterations = 0
+
         review_text = ""
         review_passed = False
         if time.monotonic() < deadline:
@@ -951,6 +1079,12 @@ def run_overnight(
             report_status = stop_status
         else:
             report_status = "review_failed"
+        # A step that failed twice, and whose replan also failed, is not a pass
+        # even when a later restore makes a weak test command look green.
+        # A kept tree that really passes the task checks and the review can
+        # still finish as passed: the failed step was not required.
+        if step_aborted and not (tests_passed and smoke_passed and verify_passed and review_passed):
+            report_status = "step_failed"
         return _finish(
             project, logger, task, profile, branch, log_dir,
             status=report_status,
@@ -972,6 +1106,7 @@ def run_overnight(
             prior_attempt=prior_attempt,
             snapshot_refs=[item.ref for item in snapshots],
             restored_snapshot=restored_snapshot,
+            steps_note=step_result.report_line,
         )
     except Exception as exc:
         logger.event("run_error", summary=f"{type(exc).__name__}: {exc}")
@@ -992,6 +1127,489 @@ def run_overnight(
         raise
     finally:
         logger.close()
+
+
+@dataclass
+class StepLoopResult:
+    enabled: bool = False
+    engaged: bool = False
+    aborted: bool = False
+    timed_out: bool = False
+    note: str = ""
+    passed: int = 0
+    total: int = 0
+    failed_index: int = 0
+    replans_used: int = 0
+    files: tuple[str, ...] = ()
+
+    @property
+    def report_line(self) -> str:
+        if not self.enabled:
+            return ""
+        if not self.engaged:
+            return "- Steps: breakdown was not usable; one implement phase\n"
+        if self.timed_out:
+            return f"- Steps: time budget after {self.passed} of {self.total} passed\n"
+        if self.aborted:
+            noun = "replan" if self.replans_used == 1 else "replans"
+            return (
+                f"- Steps: stopped on step {self.failed_index} after "
+                f"{self.replans_used} {noun}; {self.passed} passed\n"
+            )
+        return f"- Steps: {self.passed} passed of {self.total}\n"
+
+
+def _run_step_loop(
+    *,
+    client: ChatClient,
+    workspace: Workspace,
+    logger: RunLogger,
+    profile: Profile,
+    task: TaskSpec,
+    project: Path,
+    branch: str,
+    plan_text: str,
+    context_block: str,
+    deadline: float,
+    max_plan_turns: int,
+    settings: StepSettings,
+    work_guard: PhaseGuard,
+    plan_guard: PhaseGuard,
+    snapshots: list[Snapshot],
+    test_command: str,
+    lint_command: str | None,
+    planned_state: list[str],
+    repo_enabled: bool,
+    repo_tokens: int,
+    outline_cache: dict,
+    cheat_sheet: str,
+    api_patterns: tuple[str, ...],
+    base_sha: str,
+) -> StepLoopResult:
+    """Break the plan into steps. Each step is a fresh implement and fix loop.
+
+    A step that passes is snapshotted. Two failed attempts replan the remainder
+    once (or `settings.replans` times). The next failure stops the task. An
+    unparseable breakdown returns engaged=False so the caller uses one implement
+    phase.
+    """
+
+    summary = _task_summary(task, test_command)
+    breakdown_turns = max(1, min(4, max_plan_turns))
+    breakdown = _run_phase(
+        client,
+        workspace,
+        logger,
+        profile,
+        with_project_context(
+            step_breakdown_prompt(task.body, plan_text, settings.max_steps),
+            context_block,
+        ),
+        allowed={"read", "list_files"},
+        max_turns=breakdown_turns,
+        deadline=deadline,
+        phase="step-plan",
+        guard=plan_guard,
+    )
+    steps = parse_steps(
+        strip_leaked_tool_markup(breakdown.content),
+        max_steps=settings.max_steps,
+    )
+    if not steps:
+        logger.event(
+            "step_fallback",
+            summary="step list was not usable; one implement phase",
+        )
+        return StepLoopResult(
+            enabled=True,
+            note="The step breakdown was not a usable list, so the run used one implement phase.",
+        )
+    named = _remember_step_files(steps, planned_state)
+    _write_agent_file(
+        project,
+        PLAN_FILE,
+        _plan_document(task, plan_text) + "\n## Steps\n\n" + format_steps_markdown(steps) + "\n",
+    )
+    logger.event(
+        "step_plan",
+        count=len(steps),
+        steps=[{"index": step.index, "goal": step.goal, "files": step.files, "verify": step.verify} for step in steps],
+        summary=f"step_plan {len(steps)} steps",
+    )
+
+    def fresh_map(focus: list[str]) -> str:
+        if not repo_enabled:
+            return ""
+        result = render_repo_map(
+            project,
+            limit_chars=repo_tokens * 4,
+            task_text=task.body,
+            planned_paths=list(dict.fromkeys([*planned_state, *focus])),
+            recent_paths=focus,
+            cache=outline_cache,
+        )
+        logger.event(
+            "repo_map",
+            chars=len(result.text),
+            tokens=result.tokens,
+            files=result.included,
+            scanned=result.scanned,
+            truncated=result.truncated,
+            enabled=True,
+            summary=(
+                f"repo map {len(result.text)} chars (~{result.tokens} tokens, {result.included} files)"
+            ),
+        )
+        return result.text
+
+    completed: list[Step] = []
+    remaining = list(steps)
+    replans_used = 0
+    recent: list[str] = []
+
+    def finish_abort(failed: Step, output: str) -> StepLoopResult:
+        if replans_used:
+            replan_note = f" Replan ran {replans_used} time(s) and the step still failed."
+        else:
+            replan_note = " No replan was left."
+        kept = " Rolled back to the last good step." if completed else ""
+        note = (
+            f"Step {failed.index} failed {STEP_ATTEMPTS} times after its fix rounds."
+            f"{replan_note}{kept} "
+            "The task stopped instead of looping.\n"
+            + shrink_text(output, 2000)
+        )
+        return StepLoopResult(
+            enabled=True,
+            engaged=True,
+            aborted=True,
+            note=note.strip(),
+            passed=len(completed),
+            total=len(completed) + len(remaining),
+            failed_index=failed.index,
+            replans_used=replans_used,
+            files=tuple(named),
+        )
+
+    def finish_time(output: str) -> StepLoopResult:
+        return StepLoopResult(
+            enabled=True,
+            engaged=True,
+            timed_out=True,
+            note="The time budget ran out during a step.\n" + shrink_text(output, 1500),
+            passed=len(completed),
+            total=len(completed) + len(remaining),
+            replans_used=replans_used,
+            files=tuple(named),
+        )
+
+    while remaining:
+        if time.monotonic() >= deadline:
+            return finish_time("")
+        step = remaining[0]
+        display = completed + remaining
+        done = {item.index for item in completed}
+        listed = format_step_list(display, done=done, current=step.index)
+        focus = [*recent, *step.files]
+        last_output = ""
+        passed_step = False
+        for attempt in range(1, STEP_ATTEMPTS + 1):
+            if time.monotonic() >= deadline:
+                return finish_time(last_output)
+            count = len(display)
+            logger.event(
+                "step_start",
+                index=step.index,
+                count=count,
+                attempt=attempt,
+                goal=step.goal,
+                files=step.files,
+                verify=step.verify,
+                summary=f"{step.index}/{count} attempt {attempt}: {step.goal[:160]}",
+            )
+            status, last_output = _run_step_attempt(
+                client=client,
+                workspace=workspace,
+                logger=logger,
+                profile=profile,
+                task=task,
+                project=project,
+                step=step,
+                attempt=attempt,
+                deadline=deadline,
+                settings=settings,
+                work_guard=work_guard,
+                test_command=test_command,
+                lint_command=lint_command,
+                summary=summary,
+                repo_map=fresh_map(focus),
+                step_list=listed,
+                total=count,
+                previous_failure="" if attempt == 1 else last_output,
+                cheat_sheet=cheat_sheet,
+                api_patterns=api_patterns,
+                base_sha=base_sha,
+            )
+            if status == "passed":
+                logger.event(
+                    "step_pass",
+                    index=step.index,
+                    count=count,
+                    attempt=attempt,
+                    summary=f"{step.index}/{count}",
+                )
+                _record_snapshot(project, branch, snapshots, logger)
+                completed.append(remaining.pop(0))
+                for path in step.files:
+                    if path not in recent:
+                        recent.append(path)
+                passed_step = True
+                break
+            if status == "time_budget":
+                return finish_time(last_output)
+            logger.event(
+                "step_fail",
+                index=step.index,
+                count=count,
+                attempt=attempt,
+                summary=f"{step.index}/{count} attempt {attempt}",
+            )
+        if passed_step:
+            continue
+        if replans_used >= settings.replans or time.monotonic() >= deadline:
+            if time.monotonic() >= deadline and replans_used < settings.replans:
+                return finish_time(last_output)
+            return finish_abort(step, last_output)
+        replans_used += 1
+        if time.monotonic() >= deadline:
+            return finish_time(last_output)
+        replan_text = _run_phase(
+            client,
+            workspace,
+            logger,
+            profile,
+            step_replan_prompt(
+                summary=summary,
+                repo_map=fresh_map(focus),
+                completed=format_step_list(completed, done=done, current=None),
+                failed=(
+                    f"Step {step.index}\nGoal: {step.goal}\n"
+                    f"Files: {', '.join(step.files) or 'none'}\nVerify: {step.verify}"
+                ),
+                output=shrink_text(last_output, 4000),
+                max_steps=settings.max_steps,
+            ),
+            allowed={"read", "list_files"},
+            max_turns=max(1, min(4, max_plan_turns)),
+            deadline=deadline,
+            phase="step-replan" if replans_used == 1 else f"step-replan-{replans_used}",
+            guard=plan_guard,
+        )
+        start = completed[-1].index + 1 if completed else 1
+        new_steps = parse_steps(
+            strip_leaked_tool_markup(replan_text.content),
+            max_steps=settings.max_steps,
+            index_start=start,
+        )
+        _remember_step_files(new_steps, planned_state, named)
+        logger.event(
+            "replan",
+            index=step.index,
+            replans=replans_used,
+            remaining=len(new_steps),
+            summary=f"{replans_used} after step {step.index}",
+        )
+        if not new_steps:
+            return finish_abort(step, last_output)
+        remaining = new_steps
+        _write_agent_file(
+            project,
+            PLAN_FILE,
+            _plan_document(task, plan_text)
+            + "\n## Steps\n\n"
+            + format_steps_markdown(completed + remaining)
+            + "\n",
+        )
+
+    return StepLoopResult(
+        enabled=True,
+        engaged=True,
+        note=f"{len(completed)} steps passed.",
+        passed=len(completed),
+        total=len(completed),
+        replans_used=replans_used,
+        files=tuple(named),
+    )
+
+
+def _run_step_attempt(
+    *,
+    client: ChatClient,
+    workspace: Workspace,
+    logger: RunLogger,
+    profile: Profile,
+    task: TaskSpec,
+    project: Path,
+    step: Step,
+    attempt: int,
+    deadline: float,
+    settings: StepSettings,
+    work_guard: PhaseGuard,
+    test_command: str,
+    lint_command: str | None,
+    summary: str,
+    repo_map: str,
+    step_list: str,
+    total: int,
+    previous_failure: str,
+    cheat_sheet: str,
+    api_patterns: tuple[str, ...],
+    base_sha: str,
+) -> tuple[str, str]:
+    """One implement plus its fix rounds. Returns passed, failed, or time_budget."""
+
+    files = ", ".join(step.files)
+    use_suite = (not step.verify.strip()) or commands_match(step.verify, test_command)
+    paths = tuple(dict.fromkeys((*work_guard.plan_paths, *step.files)))
+    guard = replace(work_guard, plan_paths=paths)
+    phase = f"step-{step.index}" if attempt == 1 else f"step-{step.index}-retry"
+    if time.monotonic() >= deadline:
+        return "time_budget", previous_failure
+    implement = _run_phase(
+        client,
+        workspace,
+        logger,
+        profile,
+        step_implement_prompt(
+            summary=summary,
+            repo_map=repo_map,
+            step_list=step_list,
+            index=step.index,
+            total=total,
+            goal=step.goal,
+            files=files,
+            verify=step.verify or test_command,
+            previous_failure=shrink_text(previous_failure, 4000),
+        ),
+        allowed=None,
+        max_turns=settings.step_turns,
+        deadline=deadline,
+        phase=phase,
+        guard=guard,
+    )
+    if implement.status == "time_budget":
+        ok, output = _run_step_gate(
+            project, task, step, test_command, lint_command, use_suite, logger
+        )
+        return ("passed", output) if ok else ("time_budget", output)
+    ok, output = _run_step_gate(project, task, step, test_command, lint_command, use_suite, logger)
+    if ok:
+        return "passed", output
+    for fix_round in range(1, STEP_FIX_ROUNDS + 1):
+        if time.monotonic() >= deadline:
+            return "time_budget", output
+        fix_phase = f"{phase}-fix-{fix_round}"
+        header = step_fix_header(
+            summary=summary,
+            repo_map=repo_map,
+            step_list=step_list,
+            index=step.index,
+            goal=step.goal,
+            files=files,
+            verify=step.verify or test_command,
+        )
+        body = _fix_user_prompt(
+            task,
+            project,
+            output,
+            smoke_failed=False,
+            verify_failed=not use_suite,
+            cheat_sheet=cheat_sheet,
+            api_patterns=api_patterns,
+            base=base_sha,
+        )
+        fix = _run_phase(
+            client,
+            workspace,
+            logger,
+            profile,
+            header + body,
+            allowed=None,
+            max_turns=settings.step_turns,
+            deadline=deadline,
+            phase=fix_phase,
+            guard=guard,
+        )
+        ok, output = _run_step_gate(
+            project, task, step, test_command, lint_command, use_suite, logger
+        )
+        if ok:
+            return "passed", output
+        if fix.status == "time_budget":
+            return "time_budget", output
+    return "failed", output
+
+
+def _run_step_gate(
+    project: Path,
+    task: TaskSpec,
+    step: Step,
+    test_command: str,
+    lint_command: str | None,
+    use_suite: bool,
+    logger: RunLogger,
+) -> tuple[bool, str]:
+    """Run the step's verify command.
+
+    When that command is the task test command, also run lint and the task's
+    verify_commands. A targeted verify does not pull those in.
+    """
+
+    if use_suite:
+        output, ok = _run_checks(project, test_command, lint_command)
+        if ok and task.verify_commands:
+            results = _run_verify_commands(task.verify_commands, project, task.verify_timeout)
+            verify_ok = all(item.ok for item in results)
+            output = output + "\n\n" + _format_verify_log(results, verify_ok)
+            ok = verify_ok
+        command = test_command
+    else:
+        command = step.verify.strip()
+        ran = run_command(command, cwd=project, timeout=max(1, task.verify_timeout))
+        output = f"$ {command}\n{ran.output}"
+        ok = ran.ok
+    logger.event(
+        "step_check",
+        index=step.index,
+        passed=ok,
+        command=command,
+        summary=f"step_check {step.index} passed={ok}",
+    )
+    return ok, output
+
+
+def _remember_step_files(
+    steps: list[Step],
+    planned_state: list[str],
+    named: list[str] | None = None,
+) -> list[str]:
+    found = named if named is not None else []
+    for step in steps:
+        for path in step.files:
+            if path not in found:
+                found.append(path)
+            if path not in planned_state:
+                planned_state.append(path)
+    return found
+
+
+def _task_summary(task: TaskSpec, test_command: str) -> str:
+    goal = extract_section(task.body, "Goal").strip()
+    text = f"Task: {task.title}\n"
+    if goal:
+        text += f"\nGoal:\n{goal}\n"
+    text += f"\nTest command: {test_command}\n"
+    return shrink_text(text, 2000)
 
 
 def _review_and_maybe_fix(
@@ -1662,6 +2280,7 @@ def _finish(
     prior_attempt: str = "",
     snapshot_refs: list[str] | None = None,
     restored_snapshot: str = "",
+    steps_note: str = "",
 ) -> OvernightResult:
     refs = list(snapshot_refs or [])
     report = _render_report(
@@ -1686,6 +2305,7 @@ def _finish(
         prior_attempt=prior_attempt,
         snapshot_refs=refs,
         restored_snapshot=restored_snapshot,
+        steps_note=steps_note,
     )
     exclude_agent_dir(project)
     report_path = _write_agent_file(project, REPORT_FILE, report)
@@ -1737,6 +2357,7 @@ def _render_report(
     prior_attempt: str = "",
     snapshot_refs: list[str] | None = None,
     restored_snapshot: str = "",
+    steps_note: str = "",
 ) -> str:
     note = f"\n{identity_note}\n" if identity_note else ""
     questions = open_questions.strip() or "(none recorded)"
@@ -1771,6 +2392,7 @@ def _render_report(
         f"{attempt_line}"
         f"- Test iterations: {iterations}\n"
         f"- Plan phase: {plan_status}\n"
+        f"{steps_note}"
         f"{snap_line}"
         f"- Log: {log_dir}\n"
         f"{note}\n"
