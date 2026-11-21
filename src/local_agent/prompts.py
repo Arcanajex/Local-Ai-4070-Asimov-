@@ -18,6 +18,8 @@ def system_prompt(cheat_sheet: str = "") -> str:
         "elapses (default 120, maximum 600). Do not start a process you expect "
         "to keep running.\n\n"
         "Paths are relative to the project root. Do not leave the project.\n"
+        "Use list_files to list a directory. It skips bin, obj, .git, build output, "
+        "and ignored paths. Do not recurse those directories with the shell.\n"
         "Before editing a file, read it. old_string must match the file exactly once.\n"
         "After you change code, run the tests. Never say tests passed unless the "
         "command's exit code was 0.\n"
@@ -47,6 +49,8 @@ def plan_prompt(task: str) -> str:
     return (
         "Read the repository if you need to, then write a numbered plan for the task below. "
         "Do not edit files and do not run commands in this phase. "
+        "A repo map of files and symbols is included when one was built. "
+        "Use those paths, or list_files, instead of guessing directories. "
         "The plan should name the files you will change and how you will test them.\n\n"
         f"TASK:\n{task}"
     )
@@ -55,6 +59,7 @@ def plan_prompt(task: str) -> str:
 def implement_prompt(task: str, plan: str) -> str:
     return (
         "Implement the task. Follow the plan. Create and edit files with the tools. "
+        "When a repo map is in the project context, use those paths instead of guessing. "
         "Do not mock the unit under test. Run the real entry point and the tests "
         "before you stop. Re-check every acceptance criterion, then stop calling tools "
         "and summarize what you changed.\n\n"

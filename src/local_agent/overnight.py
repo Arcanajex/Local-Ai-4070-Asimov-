@@ -44,8 +44,8 @@ from local_agent.harness import AgentHarness, PhaseResult
 from local_agent.logging_util import RunLogger
 from local_agent.project_context import (
     DEFAULT_CONTEXT_CHARS,
-    build_project_context,
-    shrink_context_to_budget,
+    assemble_phase_context,
+    pack_project_context,
     with_project_context,
 )
 from local_agent.prompts import (
@@ -69,7 +69,7 @@ from local_agent.review_gate import (
     present_review,
 )
 from local_agent.snapshots import Snapshot, create_snapshot, restore_snapshot
-from local_agent.repo_map import build_repo_map
+from local_agent.repo_map import render_repo_map, resolve_repo_map_settings
 from local_agent.smoke_gate import run_smoke
 from local_agent.taskcheck import (
     extract_section,
@@ -155,6 +155,10 @@ class TaskSpec:
     # None means unset. Extraction stays off unless the task, AGENTS.md, or
     # the profile opts in. An explicit verify_commands list does not need it.
     extract_verify_commands: bool | None = None
+    # None means unset. The profile default (on, 4000 tokens) applies unless
+    # AGENTS.md front matter sets the key.
+    repo_map: bool | None = None
+    repo_map_tokens: int | None = None
     front_matter_error: str | None = None
 
 
@@ -221,6 +225,8 @@ def parse_task(text: str, path: Path | None = None) -> TaskSpec:
         verify_commands=lists.get("verify_commands", []),
         verify_timeout=_clamp_verify_timeout(_meta_int(meta.get("verify_timeout"), _VERIFY_TIMEOUT_DEFAULT)),
         extract_verify_commands=_optional_bool(meta, "extract_verify_commands"),
+        repo_map=_optional_bool(meta, "repo_map"),
+        repo_map_tokens=_optional_int(meta, "repo_map_tokens"),
         front_matter_error=error,
     )
 
@@ -409,6 +415,10 @@ def apply_project_defaults(task: TaskSpec, project: Path) -> TaskSpec:
         task.verify_timeout = _clamp_verify_timeout(_meta_int(meta.get("verify_timeout"), task.verify_timeout))
     if task.extract_verify_commands is None and "extract_verify_commands" in meta:
         task.extract_verify_commands = _optional_bool(meta, "extract_verify_commands")
+    if task.repo_map is None and "repo_map" in meta:
+        task.repo_map = _optional_bool(meta, "repo_map")
+    if task.repo_map_tokens is None and "repo_map_tokens" in meta:
+        task.repo_map_tokens = _optional_int(meta, "repo_map_tokens")
     return task
 
 
@@ -530,38 +540,90 @@ def run_overnight(
             if problems:
                 raise RuntimeError(format_problems(problems))
         workspace = Workspace(project)
-        context_block = build_project_context(project, task.context_paths, limit=context_char_limit)
-        repo_map = build_repo_map(project)
-        if repo_map.strip():
-            context_block = (context_block.rstrip() + "\n\n" + repo_map).strip() + "\n"
-        if prior_attempt.strip():
-            context_block = (
-                context_block.rstrip()
-                + "\n\nPrevious attempt\n\n"
-                + "An earlier attempt on a fresh branch failed. Tests are still the judge. "
-                + "Do not repeat an approach that already failed these checks.\n\n"
-                + prior_attempt.strip()
-                + "\n"
-            )
-        context_block = shrink_context_to_budget(
-            context_block,
-            context_tokens=profile.context,
-            generation_tokens=profile.agent_max_tokens_ceiling,
+        markers = list(profile.cheat_sheet_markers) or list(DEFAULT_CHEAT_MARKERS)
+        if task.cheat_sheet_marker and task.cheat_sheet_marker.lower() not in {item.lower() for item in markers}:
+            markers.append(task.cheat_sheet_marker)
+        packed = pack_project_context(
+            project,
+            task.context_paths,
+            limit=context_char_limit,
+            focus=task.body,
+            markers=markers,
         )
         logger.event(
             "project_context",
-            chars=len(context_block),
+            chars=len(packed.text),
             paths=["AGENTS.md", *task.context_paths],
-            summary=f"project context {len(context_block)} chars",
+            truncated=any(note.truncated for note in packed.files),
+            summary=(
+                f"project context {len(packed.text)} chars"
+                + (" (truncated)" if any(note.truncated for note in packed.files) else "")
+            ),
         )
+        for note in packed.files:
+            if not note.truncated:
+                continue
+            omitted = "; ".join(note.omitted_headings[:8])
+            extra = f"; omitted: {omitted}" if omitted else ""
+            logger.event(
+                "project_context_truncated",
+                path=note.path,
+                original_chars=note.original_chars,
+                kept_chars=note.kept_chars,
+                omitted_headings=note.omitted_headings[:30],
+                summary=(
+                    f"warning: truncated {note.path} "
+                    f"{note.original_chars} -> {note.kept_chars} chars{extra}"
+                ),
+            )
+        repo_enabled, repo_tokens = resolve_repo_map_settings(
+            task.repo_map,
+            task.repo_map_tokens,
+            profile_enabled=profile.repo_map,
+            profile_tokens=profile.repo_map_tokens,
+        )
+        if not repo_enabled:
+            logger.event("repo_map", chars=0, tokens=0, enabled=False, summary="repo map disabled")
+        outline_cache: dict = {}
+        planned_state: list[str] = []
+
+        def refresh_context() -> str:
+            mapped = ""
+            if repo_enabled:
+                result = render_repo_map(
+                    project,
+                    limit_chars=repo_tokens * 4,
+                    task_text=task.body,
+                    planned_paths=planned_state,
+                    cache=outline_cache,
+                )
+                mapped = result.text
+                logger.event(
+                    "repo_map",
+                    chars=len(mapped),
+                    tokens=result.tokens,
+                    files=result.included,
+                    scanned=result.scanned,
+                    truncated=result.truncated,
+                    enabled=True,
+                    summary=(
+                        f"repo map {len(mapped)} chars (~{result.tokens} tokens, {result.included} files)"
+                    ),
+                )
+            return assemble_phase_context(
+                packed.text,
+                mapped,
+                prior=prior_attempt,
+                context_tokens=profile.context,
+                generation_tokens=profile.agent_max_tokens_ceiling,
+            )
+
+        context_block = refresh_context()
         branch = _create_branch(project, slugify(task.title), attempt=branch_attempt)
         # The commit the task started from. Later agent commits move HEAD, so a
         # diff against HEAD would only see the last round and look empty.
         base_sha = _git(project, "rev-parse", "HEAD").strip() if _head_exists(project) else ""
         logger.event("task_base", commit=base_sha, summary=f"task base {base_sha[:12] or '(none)'}")
-        markers = list(profile.cheat_sheet_markers) or list(DEFAULT_CHEAT_MARKERS)
-        if task.cheat_sheet_marker and task.cheat_sheet_marker.lower() not in {item.lower() for item in markers}:
-            markers.append(task.cheat_sheet_marker)
         cheat_sheet = collect_cheat_sheets(project, task.context_paths, markers)
         api_patterns = tuple(profile.api_misuse_patterns) or DEFAULT_API_MISUSE
         if task.api_error_patterns:
@@ -592,7 +654,7 @@ def run_overnight(
         plan = _run_phase(
             client, workspace, logger, profile,
             with_project_context(plan_prompt(task.body), context_block),
-            allowed={"read"},
+            allowed={"read", "list_files"},
             max_turns=max_plan_turns,
             deadline=deadline,
             phase="plan",
@@ -607,6 +669,8 @@ def run_overnight(
             paths=list(plan_file_paths),
             summary=", ".join(plan_file_paths[:12]) or "(none)",
         )
+        planned_state[:] = list(plan_file_paths)
+        context_block = refresh_context()
         probe_guard = PhaseGuard(
             exploration_cap=exploration_cap,
             exploration_bonus_turns=exploration_bonus,
@@ -631,6 +695,7 @@ def run_overnight(
                 identity_note=identity_note,
             )
 
+        context_block = refresh_context()
         implement = _run_phase(
             client, workspace, logger, profile,
             with_project_context(implement_prompt(task.body, plan_text), context_block),
@@ -718,6 +783,7 @@ def run_overnight(
                     )
                     break
                 before_fix = snapshot_tree(project)
+                context_block = refresh_context()
                 fix = _run_phase(
                     client, workspace, logger, profile,
                     with_project_context(
@@ -768,6 +834,7 @@ def run_overnight(
                 stop_status = "time_budget"
                 break
             before_fix = snapshot_tree(project)
+            context_block = refresh_context()
             fix = _run_phase(
                 client, workspace, logger, profile,
                 with_project_context(
@@ -829,6 +896,7 @@ def run_overnight(
                     profile=profile,
                     task=task,
                     context_block=context_block,
+                    refresh_context=refresh_context,
                     tests_passed=tests_passed,
                     smoke_passed=smoke_passed,
                     smoke_ran=smoke_ran,
@@ -934,6 +1002,7 @@ def _review_and_maybe_fix(
     profile: Profile,
     task: TaskSpec,
     context_block: str,
+    refresh_context: Any = None,
     tests_passed: bool,
     smoke_passed: bool,
     smoke_ran: bool,
@@ -961,6 +1030,13 @@ def _review_and_maybe_fix(
     """
 
     verify_results = list(verify_results or [])
+
+    def current_context() -> str:
+        if refresh_context is None:
+            return context_block
+        return refresh_context()
+
+    context_block = current_context()
 
     def pack(
         review_text: str,
@@ -1016,6 +1092,7 @@ def _review_and_maybe_fix(
     if time.monotonic() >= deadline:
         return pack(review_text, False, tests_passed, smoke_passed, smoke_ran, test_output, stop_status)
     passing_before = tests_passed and smoke_passed and verify_passed
+    context_block = current_context()
     _run_phase(
         client, workspace, logger, profile,
         with_project_context(
@@ -1052,6 +1129,7 @@ def _review_and_maybe_fix(
     _record_snapshot(workspace.root, branch, snapshots, logger)
     if time.monotonic() >= deadline:
         return pack(review_text, False, tests_passed, smoke_passed, smoke_ran, test_output, stop_status)
+    context_block = current_context()
     review_text, problems, malformed = _one_review(
         client,
         workspace,
@@ -1483,7 +1561,7 @@ def _run_test_first(
             test_first_prompt(task.body, extract_section(task.body, "Acceptance criteria")),
             context_block,
         ),
-        allowed={"read", "write", "edit"},
+        allowed={"read", "list_files", "write", "edit"},
         max_turns=max_turns,
         deadline=deadline,
         phase="test-first",
@@ -1501,7 +1579,7 @@ def _run_test_first(
                 test_first_repair_prompt(task.body, shrink_text(output, 8_000)),
                 context_block,
             ),
-            allowed={"read", "write", "edit"},
+            allowed={"read", "list_files", "write", "edit"},
             max_turns=max_turns,
             deadline=deadline,
             phase="test-first-repair",

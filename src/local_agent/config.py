@@ -49,6 +49,8 @@ OVERRIDABLE = {
     "extra_scratch_markers",
     "review_verify_only_pass",
     "extract_verify_commands",
+    "repo_map",
+    "repo_map_tokens",
 }
 
 
@@ -121,6 +123,10 @@ class Profile:
     # Backtick commands in Acceptance criteria are not run unless this is
     # set. A guessed command is riskier than an explicit verify_commands list.
     extract_verify_commands: bool = False
+    # Symbol index injected into plan and implement. Tokens are estimated at
+    # 4 characters each. 4000 sits in the 3–6k band; the resolver caps at 6000.
+    repo_map: bool = True
+    repo_map_tokens: int = 4000
 
     @property
     def offload_flag(self) -> str:
@@ -276,6 +282,8 @@ def profile_from_dict(name: str, data: dict[str, Any], defaults: dict[str, Any])
         extra_scratch_markers=_as_str_list(merged.get("extra_scratch_markers")),
         review_verify_only_pass=_as_bool(merged.get("review_verify_only_pass", True)),
         extract_verify_commands=_as_bool(merged.get("extract_verify_commands", False)),
+        repo_map=_as_bool(merged.get("repo_map", True)),
+        repo_map_tokens=_as_int(merged.get("repo_map_tokens", 4000), "repo_map_tokens"),
     )
 
 

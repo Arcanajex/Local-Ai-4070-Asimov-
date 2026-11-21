@@ -311,7 +311,7 @@ def is_exploration_call(
 ) -> bool:
     """Read-only or probing calls. A write, an edit, or a build is not one."""
 
-    if name == "read":
+    if name in {"read", "list_files"}:
         return True
     if name in {"write", "edit"}:
         return False
