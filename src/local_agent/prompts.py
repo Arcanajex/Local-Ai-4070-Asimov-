@@ -232,6 +232,126 @@ def review_format_reminder() -> str:
     )
 
 
+def step_breakdown_prompt(task: str, plan: str, max_steps: int) -> str:
+    """Ask for a step list. Wording must not match the plan phase's refusal line.
+
+    Scripted clients and the plan phase key off "Do not edit files and do not
+    run commands in this phase". This prompt stays off that phrase so a plan
+    reply is not reused as a step list.
+    """
+
+    cap = max(1, int(max_steps))
+    return (
+        "Split the plan into small verified steps. "
+        "Do not edit files. Reply with the step list only.\n"
+        f"Use 1 step when the task is tiny. Otherwise use 3 to {cap} steps. "
+        f"Never more than {cap}. Each step is one small change that can be checked "
+        "before the next one starts.\n"
+        "Every step needs a goal, the files it will touch, and one verify command "
+        "(a build, a test, or a targeted test). Use paths from the repo map when "
+        "one is shown. Do not invent a command that the task did not name; the "
+        "task test command is the right verify when the step should turn the suite green.\n\n"
+        "Use this shape, and nothing else:\n"
+        "### Step 1\n"
+        "Goal: what this step makes true\n"
+        "Files: path/one.cs, path/two.cs\n"
+        "Verify: the one command for this step\n\n"
+        f"PLAN:\n{plan}\n\nTASK:\n{task}"
+    )
+
+
+def step_implement_prompt(
+    *,
+    summary: str,
+    repo_map: str,
+    step_list: str,
+    index: int,
+    total: int,
+    goal: str,
+    files: str,
+    verify: str,
+    previous_failure: str = "",
+) -> str:
+    """Compact prompt for one step. The harness starts a fresh conversation around it."""
+
+    failure = ""
+    if previous_failure.strip():
+        failure = (
+            "\n\nThis step already failed once. Make a smaller change. "
+            "The last check said:\n"
+            f"{previous_failure.strip()}\n"
+        )
+    mapped = repo_map.strip() or "(no source files to outline)"
+    return (
+        f"{summary.strip()}\n\n"
+        f"## Repo map\n\n{mapped}\n\n"
+        f"## Steps\n\n{step_list.strip() or '(none)'}\n\n"
+        "## Current step\n\n"
+        f"Step {index} of {total}\n"
+        f"Goal: {goal}\n"
+        f"Files: {files or 'none'}\n"
+        f"Verify: {verify}\n"
+        "The runner runs that verify command after you stop. "
+        "Implement this step only. Do not start later steps. "
+        "Read a file before you edit it. Use the repo map paths instead of guessing. "
+        "When this step is done, stop calling tools and summarize it."
+        f"{failure}"
+    )
+
+
+def step_replan_prompt(
+    *,
+    summary: str,
+    repo_map: str,
+    completed: str,
+    failed: str,
+    output: str,
+    max_steps: int,
+) -> str:
+    cap = max(1, int(max_steps))
+    mapped = repo_map.strip() or "(no source files to outline)"
+    return (
+        "The current step failed twice. Re-plan the remaining steps from the current tree. "
+        "Do not edit files. Reply with the new step list only.\n"
+        "Completed steps stay done. Do not repeat them. "
+        f"Use at most {cap} steps. One step is allowed.\n"
+        "Use this shape:\n"
+        "### Step 1\n"
+        "Goal: what is still missing\n"
+        "Files: path/one.cs\n"
+        "Verify: the one command for this step\n\n"
+        f"{summary.strip()}\n\n"
+        f"## Repo map\n\n{mapped}\n\n"
+        f"## Completed\n\n{completed.strip() or '(none)'}\n\n"
+        f"## Failed step\n\n{failed.strip()}\n\n"
+        f"## Last check output\n\n{output.strip() or '(none)'}\n"
+    )
+
+
+def step_fix_header(
+    *,
+    summary: str,
+    repo_map: str,
+    step_list: str,
+    index: int,
+    goal: str,
+    files: str,
+    verify: str,
+) -> str:
+    mapped = repo_map.strip() or "(no source files to outline)"
+    return (
+        f"{summary.strip()}\n\n"
+        f"## Repo map\n\n{mapped}\n\n"
+        f"## Steps\n\n{step_list.strip() or '(none)'}\n\n"
+        "## Current step\n\n"
+        f"Step {index}\n"
+        f"Goal: {goal}\n"
+        f"Files: {files or 'none'}\n"
+        f"Verify: {verify}\n"
+        "Fix this step only. Do not start later steps.\n\n"
+    )
+
+
 def review_fix_prompt(task: str, review: str, changed_files: str) -> str:
     return (
         "The self-review rejected the change. Fix only the findings in the review. "

@@ -21,6 +21,16 @@ from local_agent.overnight import OvernightResult, load_task, run_overnight
 from local_agent.paths import repo_root
 from local_agent.shells import python_shell
 
+# The same command the mock run passes as test_command. The step list has to
+# name it exactly so the step gate runs this interpreter, not a bare `python`.
+_PYTEST = python_shell("-m", "pytest", "-q")
+_STEP_LIST = (
+    "### Step 1\n"
+    "Goal: Add adder.py with add(a, b) and test_adder.py asserting add(2, 3) == 5\n"
+    "Files: adder.py, test_adder.py\n"
+    f"Verify: {_PYTEST}\n"
+)
+
 ADDER_BUG = "def add(a, b):\n    return a - b\n"
 ADDER_TEST = "from adder import add\n\n\ndef test_add():\n    assert add(2, 3) == 5\n"
 REVIEW = (
@@ -52,9 +62,11 @@ class ScriptedSmokeClient:
         # Context is prepended, so the phase instruction is not always at column 0.
         if "Do not edit files and do not run commands in this phase" in prompt:
             return _text("1. Add adder.py with add(a, b).\n2. Add test_adder.py.\n3. Run pytest.")
+        if "Split the plan into small verified steps" in prompt:
+            return _text(_STEP_LIST)
         if "The self-review rejected" in prompt:
             return _text("Adjusted the change to match the review.")
-        if "The tests failed" in prompt:
+        if "The tests failed" in prompt or "Fix this step only" in prompt:
             self.fix_calls += 1
             if self.fix_calls == 1:
                 return _call(
@@ -66,7 +78,7 @@ class ScriptedSmokeClient:
                     },
                 )
             return _text("Fixed add to return a sum.")
-        if "Implement the task." in prompt:
+        if "Implement the task." in prompt or "Implement this step only" in prompt:
             self.implement_calls += 1
             if self.implement_calls == 1:
                 return _call("write", {"path": "adder.py", "content": ADDER_BUG})
