@@ -1,4 +1,4 @@
-"""The tools local models actually complete: read, list_files, write, edit, shell.
+"""The tools local models actually complete: read, list_files, lookup_api, write, edit, shell.
 
 Schemas stay flat on purpose. Nested JSON and large optional objects are
 where  the 8GB bench saw tool-call failures. The shell always has a timeout
@@ -44,6 +44,7 @@ _BLOCKED_COMMANDS = (
 class ToolResult:
     ok: bool
     output: str
+    hits: int | None = None
 
 
 def shell_description() -> str:
@@ -60,7 +61,7 @@ def shell_description() -> str:
     )
 
 
-def tool_schemas(allowed: set[str] | None = None) -> list[dict[str, Any]]:
+def tool_schemas(allowed: set[str] | None = None, *, api_lookup: bool = True) -> list[dict[str, Any]]:
     """OpenAI tool definitions. `allowed` restricts a phase (plan is read-only)."""
 
     specs = {
@@ -98,6 +99,27 @@ def tool_schemas(allowed: set[str] | None = None) -> list[dict[str, Any]]:
                         },
                     },
                     "required": ["path"],
+                },
+            },
+        },
+        "lookup_api": {
+            "type": "function",
+            "function": {
+                "name": "lookup_api",
+                "description": (
+                    "Look up a public NuGet type or member from the project's packages. "
+                    "Pass a type name, a member name, or Type.Member. "
+                    "Returns signatures and a short summary."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Type, member, or Type.Member.",
+                        },
+                    },
+                    "required": ["query"],
                 },
             },
         },
@@ -151,7 +173,9 @@ def tool_schemas(allowed: set[str] | None = None) -> list[dict[str, Any]]:
             },
         },
     }
-    names = ["read", "list_files", "write", "edit", "shell"]
+    names = ["read", "list_files", "lookup_api", "write", "edit", "shell"]
+    if not api_lookup:
+        names = [name for name in names if name != "lookup_api"]
     if allowed is not None:
         names = [name for name in names if name in allowed]
     return [specs[name] for name in names]
@@ -165,6 +189,13 @@ class Workspace:
         # rel posix path -> exact bytes. Test-first files live here so a later
         # phase cannot edit or delete them. Empty unless a phase locks files.
         self.locked: dict[str, bytes] = {}
+        # NuGet API lookup. The overnight runner sets these from the task,
+        # AGENTS.md, and the profile. A bare Workspace still answers the tool.
+        self.api_lookup_enabled = True
+        self.api_lookup_budget = 1600
+        self.api_cache_dir: Path | None = None
+        self.nuget_roots: list[Path] | None = None
+        self._api_index = None
 
     def resolve(self, raw_path: str) -> Path:
         if not isinstance(raw_path, str) or not raw_path.strip():
@@ -538,6 +569,19 @@ def _cap_output(text: str, limit: int) -> str:
     return f"{text[:head]}\n...[truncated {omitted} chars]...\n{text[-tail:] if tail else ''}"
 
 
+def _lookup_api(workspace: Workspace, query: Any) -> ToolResult:
+    if not workspace.api_lookup_enabled:
+        return ToolResult(False, "lookup_api is disabled for this run.", hits=0)
+    from local_agent.api_index import ensure_index, lookup
+
+    try:
+        index = ensure_index(workspace)
+        result = lookup(index, str(query or ""), budget=workspace.api_lookup_budget)
+    except Exception as exc:
+        return ToolResult(False, f"lookup_api failed: {exc}", hits=0)
+    return ToolResult(True, result.text or "No matching public API.", hits=result.hits)
+
+
 def dispatch(name: str, arguments: dict[str, Any], workspace: Workspace) -> ToolResult:
     arguments = arguments or {}
     try:
@@ -549,6 +593,8 @@ def dispatch(name: str, arguments: dict[str, Any], workspace: Workspace) -> Tool
             )
         if name == "list_files":
             return workspace.list_files(str(arguments.get("path") or "."))
+        if name == "lookup_api":
+            return _lookup_api(workspace, arguments.get("query"))
         if name == "write":
             return workspace.write(arguments.get("path", ""), arguments.get("content", ""))
         if name == "edit":

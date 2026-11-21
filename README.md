@@ -334,6 +334,8 @@ Optional front matter, all unset by default except the turn budgets and the expl
 | `max_steps` | `6` | Cap on the step list. One step is allowed. Clamped to 1–8. |
 | `step_turns` | `12` | Turn budget for each step's implement phase and for each of its fix rounds. The outer fix and review-fix still use `implement_turns`. |
 | `step_replans` | `1` | How many times a step that failed twice may replan the remaining work. `0` stops at the second failure. Clamped to 0–3. |
+| `api_lookup` | `true` | Index referenced NuGet packages and expose `lookup_api`. On a CS1061, CS1503, CS0117, CS7036, or similar error, the fix prompt gets the real signatures. Set `false` to turn that off. |
+| `api_lookup_budget` | `1600` | Characters kept from one lookup. Clamped to 200–4000. |
 
 The same numeric keys can sit on the profile in `profiles\models.json` or under that profile in `runtime\overrides.json`. A value in the task file wins over the profile. Passing an explicit turn budget to the Python function (the tests and the eval runner do this) wins over the task file. See [docs/TASK_TEMPLATE.md](docs/TASK_TEMPLATE.md).
 
@@ -351,6 +353,8 @@ The target repo should have an `AGENTS.md` at its root. That file, plus any path
 A **repo map** is appended after that block, in its own budget, so it does not steal characters from `AGENTS.md`. It lists files and their symbols (C# namespaces, classes, methods, and fields, plus Python, with a short fallback for other source files). `bin/`, `obj/`, `.git`, build output, vendored directories, and `.gitignore` matches are skipped. Files mentioned by the task, named in the plan, changed recently, or referenced by those files are ranked first. The default budget is 4,000 tokens (about 16,000 characters). Set `repo_map: false` or `repo_map_tokens` on the task, in `AGENTS.md`, or on the profile (`runtime\overrides.json`). The task wins, then `AGENTS.md`, then the profile. The map is rebuilt before each later phase so new symbols show up, and it stays in the first user message only, which compaction keeps. Its size is logged as `repo map N chars`.
 
 `list_files` lists a directory with the same skips. A recursive `Get-ChildItem -Recurse`, `ls -R`, or `find` is answered the same way instead of walking `bin/` and `obj/`.
+
+`lookup_api` reads the public API of NuGet packages referenced by `obj/project.assets.json` (or by `PackageReference` when that file is missing). It uses each package's XML docs in the NuGet cache, and the assembly metadata when a package ships no XML file. Results are cached per package version under `runtime/api-index`. A fix or step-fix prompt that contains `CS1061`, `CS1503`, `CS0117`, `CS7036`, or a similar member error gets those signatures injected. The task wins over `AGENTS.md`, which wins over the profile. Lookups are logged as `api_lookup` (the tool) and `api_autolookup` (compiler errors).
 
 Compaction keeps the first user message, so the project context and the one repo map are not dropped when tool output is trimmed. The prompt itself is capped at 32,768 estimated tokens even though the quality context is 65,536, so the completion still has room.
 

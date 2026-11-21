@@ -55,6 +55,8 @@ OVERRIDABLE = {
     "max_steps",
     "step_turns",
     "step_replans",
+    "api_lookup",
+    "api_lookup_budget",
 }
 
 
@@ -140,6 +142,11 @@ class Profile:
     max_steps: int = 6
     step_turns: int = 12
     step_replans: int = 1
+    # NuGet API lookup. On by default: a .NET task with no package index
+    # gets an empty result, and a task that has packages gets real signatures
+    # instead of a hand-written cheat sheet. Task and AGENTS.md override these.
+    api_lookup: bool = True
+    api_lookup_budget: int = 1600
 
     @property
     def offload_flag(self) -> str:
@@ -301,6 +308,8 @@ def profile_from_dict(name: str, data: dict[str, Any], defaults: dict[str, Any])
         max_steps=_as_int(merged.get("max_steps", 6), "max_steps"),
         step_turns=_as_int(merged.get("step_turns", 12), "step_turns"),
         step_replans=_as_int(merged.get("step_replans", 1), "step_replans"),
+        api_lookup=_as_bool(merged.get("api_lookup", True)),
+        api_lookup_budget=_as_int(merged.get("api_lookup_budget", 1600), "api_lookup_budget"),
     )
 
 

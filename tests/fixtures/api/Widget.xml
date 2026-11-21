@@ -1,0 +1,47 @@
+<?xml version="1.0"?>
+<doc>
+  <assembly>
+    <name>Widget</name>
+  </assembly>
+  <members>
+    <member name="T:Ns.Widget">
+      <summary>A drawable widget.</summary>
+    </member>
+    <member name="T:Ns.Widget.Inner">
+      <summary>Nested helper.</summary>
+    </member>
+    <member name="T:Ns.Generic`1">
+      <typeparam name="T">The item type.</typeparam>
+      <summary>A generic box.</summary>
+    </member>
+    <member name="M:Ns.Widget.Draw(System.Int32)">
+      <summary>Draw <paramref name="count"/> times. See <see cref="M:Ns.Widget.Add(System.Int32,System.Int32)"/>.</summary>
+      <param name="count">How many.</param>
+    </member>
+    <member name="M:Ns.Widget.Add(System.Int32,System.Int32)">
+      <summary>Add two ints.</summary>
+      <param name="a">Left.</param>
+      <param name="b">Right.</param>
+      <returns>The sum.</returns>
+    </member>
+    <member name="M:Ns.Widget.Add(System.String,System.String)">
+      <summary>Concatenate.</summary>
+      <param name="a">Left text.</param>
+      <param name="b">Right text.</param>
+    </member>
+    <member name="M:Ns.Generic`1.Method``1(``0,System.Int32)">
+      <summary>Generic method.</summary>
+      <param name="item">The item.</param>
+      <param name="scale">The scale.</param>
+    </member>
+    <member name="P:Ns.Widget.Name">
+      <summary>Display name.</summary>
+    </member>
+    <member name="F:Ns.Widget.Id">
+      <summary>Identifier.</summary>
+    </member>
+    <member name="M:Ns.Widget.Inner.Ping">
+      <summary>Ping the inner widget.</summary>
+    </member>
+  </members>
+</doc>

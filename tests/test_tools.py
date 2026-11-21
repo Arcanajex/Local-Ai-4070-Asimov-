@@ -110,7 +110,9 @@ def test_list_files_skips_bin_obj_and_ignored_paths(tmp_path):
 
 def test_tool_schemas_are_flat_and_can_be_restricted_to_read():
     names = [schema["function"]["name"] for schema in tool_schemas()]
-    assert names == ["read", "list_files", "write", "edit", "shell"]
+    assert names == ["read", "list_files", "lookup_api", "write", "edit", "shell"]
+    without = [schema["function"]["name"] for schema in tool_schemas(api_lookup=False)]
+    assert without == ["read", "list_files", "write", "edit", "shell"]
     for schema in tool_schemas():
         properties = schema["function"]["parameters"]["properties"]
         for prop in properties.values():
