@@ -69,9 +69,12 @@ class AgentHarness:
         guard: PhaseGuard | None = None,
     ) -> PhaseResult:
         guard = guard or PhaseGuard(exploration_cap=self.profile.exploration_cap)
-        schemas = tool_schemas(self.allowed_tools)
+        api_tool = bool(getattr(self.workspace, "api_lookup_enabled", False)) and (
+            self.allowed_tools is None or "lookup_api" in self.allowed_tools
+        )
+        schemas = tool_schemas(self.allowed_tools, api_lookup=api_tool)
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": system_prompt(guard.cheat_sheet)},
+            {"role": "system", "content": system_prompt(guard.cheat_sheet, api_lookup=api_tool)},
             {"role": "user", "content": user_prompt},
         ]
         detector = LoopDetector()
@@ -335,6 +338,16 @@ class AgentHarness:
         if self.allowed_tools is not None and call.name not in self.allowed_tools:
             return f"tool {call.name} is not available in this phase", False, explored, False
         tool_result = dispatch(call.name, call.arguments, self.workspace)
+        if call.name == "lookup_api":
+            self._log_api_index()
+            query = str((call.arguments or {}).get("query") or "")
+            hits = 0 if tool_result.hits is None else tool_result.hits
+            self.logger.event(
+                "api_lookup",
+                query=query,
+                hits=hits,
+                summary=f"api_lookup query={query} hits={hits}",
+            )
         output = tool_result.output
         ok = tool_result.ok
         restored = self.workspace.restore_locked()
@@ -347,6 +360,20 @@ class AgentHarness:
             ok = False
         wrote = bool(ok and call.name in {"write", "edit"})
         return output, ok, explored and not wrote, wrote
+
+    def _log_api_index(self) -> None:
+        index = getattr(self.workspace, "_api_index", None)
+        if index is None or getattr(index, "logged", False):
+            return
+        for warning in index.warnings:
+            self.logger.event("api_index", summary=str(warning)[:500])
+        self.logger.event(
+            "api_index",
+            packages=len(index.packages),
+            members=len(index.members),
+            summary=f"api_index packages={len(index.packages)} members={len(index.members)}",
+        )
+        index.logged = True
 
     def _complete(
         self,

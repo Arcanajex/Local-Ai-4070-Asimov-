@@ -19,6 +19,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from local_agent.api_index import (
+    autolookup,
+    ensure_index,
+    output_needs_api_lookup,
+    resolve_api_lookup_settings,
+)
 from local_agent.client import ChatClient
 from local_agent.config import Profile, get_profile
 from local_agent.context import shrink_text
@@ -42,6 +48,7 @@ from local_agent.guardrails import (
 )
 from local_agent.harness import AgentHarness, PhaseResult
 from local_agent.logging_util import RunLogger
+from local_agent.paths import runtime_dir
 from local_agent.project_context import (
     DEFAULT_CONTEXT_CHARS,
     assemble_phase_context,
@@ -181,6 +188,10 @@ class TaskSpec:
     max_steps: int | None = None
     step_turns: int | None = None
     step_replans: int | None = None
+    # None means unset. API lookup is on unless the task, AGENTS.md, or the
+    # profile turns it off. The budget is characters in one lookup result.
+    api_lookup: bool | None = None
+    api_lookup_budget: int | None = None
     front_matter_error: str | None = None
 
 
@@ -253,6 +264,8 @@ def parse_task(text: str, path: Path | None = None) -> TaskSpec:
         max_steps=_optional_int(meta, "max_steps"),
         step_turns=_optional_int(meta, "step_turns"),
         step_replans=_optional_int(meta, "step_replans"),
+        api_lookup=_optional_bool(meta, "api_lookup"),
+        api_lookup_budget=_optional_int(meta, "api_lookup_budget"),
         front_matter_error=error,
     )
 
@@ -453,6 +466,10 @@ def apply_project_defaults(task: TaskSpec, project: Path) -> TaskSpec:
         task.step_turns = _optional_int(meta, "step_turns")
     if task.step_replans is None and "step_replans" in meta:
         task.step_replans = _optional_int(meta, "step_replans")
+    if task.api_lookup is None and "api_lookup" in meta:
+        task.api_lookup = _optional_bool(meta, "api_lookup")
+    if task.api_lookup_budget is None and "api_lookup_budget" in meta:
+        task.api_lookup_budget = _optional_int(meta, "api_lookup_budget")
     return task
 
 
@@ -572,6 +589,12 @@ def run_overnight(
             profile_step_turns=profile.step_turns,
             profile_replans=profile.step_replans,
         )
+        api_settings = resolve_api_lookup_settings(
+            task.api_lookup,
+            task.api_lookup_budget,
+            profile_enabled=profile.api_lookup,
+            profile_budget=profile.api_lookup_budget,
+        )
         use_test_first = task.test_first if test_first is None else bool(test_first)
         identity_note = ensure_repository(project, init_repo=init_repo) or ""
         if identity_note:
@@ -584,6 +607,9 @@ def run_overnight(
             if problems:
                 raise RuntimeError(format_problems(problems))
         workspace = Workspace(project)
+        workspace.api_lookup_enabled = api_settings.enabled
+        workspace.api_lookup_budget = api_settings.budget
+        workspace.api_cache_dir = runtime_dir() / "api-index"
         markers = list(profile.cheat_sheet_markers) or list(DEFAULT_CHEAT_MARKERS)
         if task.cheat_sheet_marker and task.cheat_sheet_marker.lower() not in {item.lower() for item in markers}:
             markers.append(task.cheat_sheet_marker)
@@ -686,6 +712,8 @@ def run_overnight(
             max_steps=step_settings.max_steps,
             step_turns=step_settings.step_turns,
             step_replans=step_settings.replans,
+            api_lookup=api_settings.enabled,
+            api_lookup_budget=api_settings.budget,
             cheat_sheet_chars=len(cheat_sheet),
             summary=branch,
         )
@@ -702,7 +730,7 @@ def run_overnight(
         plan = _run_phase(
             client, workspace, logger, profile,
             with_project_context(plan_prompt(task.body), context_block),
-            allowed={"read", "list_files"},
+            allowed=_read_tools(workspace),
             max_turns=max_plan_turns,
             deadline=deadline,
             phase="plan",
@@ -919,6 +947,8 @@ def run_overnight(
                             cheat_sheet=cheat_sheet,
                             api_patterns=api_patterns,
                             base=base_sha,
+                            workspace=workspace,
+                            logger=logger,
                         ),
                         context_block,
                     ),
@@ -970,6 +1000,8 @@ def run_overnight(
                         cheat_sheet=cheat_sheet,
                         api_patterns=api_patterns,
                         base=base_sha,
+                        workspace=workspace,
+                        logger=logger,
                     ),
                     context_block,
                 ),
@@ -1205,7 +1237,7 @@ def _run_step_loop(
             step_breakdown_prompt(task.body, plan_text, settings.max_steps),
             context_block,
         ),
-        allowed={"read", "list_files"},
+        allowed=_read_tools(workspace),
         max_turns=breakdown_turns,
         deadline=deadline,
         phase="step-plan",
@@ -1399,7 +1431,7 @@ def _run_step_loop(
                 output=shrink_text(last_output, 4000),
                 max_steps=settings.max_steps,
             ),
-            allowed={"read", "list_files"},
+            allowed=_read_tools(workspace),
             max_turns=max(1, min(4, max_plan_turns)),
             deadline=deadline,
             phase="step-replan" if replans_used == 1 else f"step-replan-{replans_used}",
@@ -1527,6 +1559,8 @@ def _run_step_attempt(
             cheat_sheet=cheat_sheet,
             api_patterns=api_patterns,
             base=base_sha,
+            workspace=workspace,
+            logger=logger,
         )
         fix = _run_phase(
             client,
@@ -2123,6 +2157,36 @@ def _exit_code_from_output(output: str) -> int | None:
     return int(match.group(1))
 
 
+def _read_tools(workspace: Workspace) -> set[str]:
+    tools = {"read", "list_files"}
+    if getattr(workspace, "api_lookup_enabled", False):
+        tools.add("lookup_api")
+    return tools
+
+
+def _edit_tools(workspace: Workspace) -> set[str]:
+    return _read_tools(workspace) | {"write", "edit"}
+
+
+def _api_lookup_block(workspace: Workspace, test_output: str, logger: RunLogger | None) -> str:
+    """Signatures for compiler errors, logged as api_autolookup."""
+
+    if not getattr(workspace, "api_lookup_enabled", False):
+        return ""
+    if not output_needs_api_lookup(test_output):
+        return ""
+    index = ensure_index(workspace, logger)
+    result = autolookup(index, test_output, budget=workspace.api_lookup_budget)
+    if logger is not None:
+        logger.event(
+            "api_autolookup",
+            query=result.query,
+            hits=result.hits,
+            summary=f"api_autolookup query={result.query} hits={result.hits}",
+        )
+    return result.text
+
+
 def _fix_user_prompt(
     task: TaskSpec,
     project: Path,
@@ -2134,9 +2198,14 @@ def _fix_user_prompt(
     cheat_sheet: str = "",
     api_patterns: tuple[str, ...] = (),
     base: str = "",
+    workspace: Workspace | None = None,
+    logger: RunLogger | None = None,
 ) -> str:
     diff = fit_review_diff(working_tree_diff(project, base), FIX_DIFF_CHARS)
     cited = format_traceback_files(project, test_output)
+    api_text = ""
+    if workspace is not None:
+        api_text = _api_lookup_block(workspace, test_output, logger)
     return fix_prompt(
         task.body,
         shrink_text(test_output, 12_000),
@@ -2148,6 +2217,7 @@ def _fix_user_prompt(
         false_pass_reason=false_pass_reason,
         cheat_sheet=cheat_sheet,
         api_reminder=looks_like_api_misuse(test_output, api_patterns),
+        api_lookup=api_text,
     )
 
 
@@ -2179,7 +2249,7 @@ def _run_test_first(
             test_first_prompt(task.body, extract_section(task.body, "Acceptance criteria")),
             context_block,
         ),
-        allowed={"read", "list_files", "write", "edit"},
+        allowed=_edit_tools(workspace),
         max_turns=max_turns,
         deadline=deadline,
         phase="test-first",
@@ -2197,7 +2267,7 @@ def _run_test_first(
                 test_first_repair_prompt(task.body, shrink_text(output, 8_000)),
                 context_block,
             ),
-            allowed={"read", "list_files", "write", "edit"},
+            allowed=_edit_tools(workspace),
             max_turns=max_turns,
             deadline=deadline,
             phase="test-first-repair",

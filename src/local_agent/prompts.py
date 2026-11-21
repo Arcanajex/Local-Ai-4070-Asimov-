@@ -9,7 +9,7 @@ def shell_name() -> str:
     return "PowerShell" if os.name == "nt" else "bash"
 
 
-def system_prompt(cheat_sheet: str = "") -> str:
+def system_prompt(cheat_sheet: str = "", *, api_lookup: bool = False) -> str:
     shell = shell_name()
     base = (
         "You are a local coding agent. The repository is on disk. "
@@ -33,6 +33,11 @@ def system_prompt(cheat_sheet: str = "") -> str:
         "Open questions heading and list what is unresolved.\n"
         "When the task is done, stop calling tools and reply with a short summary."
     )
+    if api_lookup:
+        base += (
+            "\nWhen you are unsure of a library type or member, call lookup_api "
+            "with its name and use the signature it returns."
+        )
     sheet = cheat_sheet.strip()
     if not sheet:
         return base
@@ -79,6 +84,7 @@ def fix_prompt(
     false_pass_reason: str = "",
     cheat_sheet: str = "",
     api_reminder: bool = False,
+    api_lookup: str = "",
 ) -> str:
     if false_pass_reason.strip():
         lead = (
@@ -110,6 +116,14 @@ def fix_prompt(
             "decompile, or probe with reflection.\n\n"
             f"{sheet}\n"
         )
+    lookup = api_lookup.strip()
+    lookup_block = ""
+    if lookup:
+        lookup_block = (
+            "\n\nAPI lookup (signatures from the project's NuGet packages; "
+            "trust these over memory):\n\n"
+            f"{lookup}\n"
+        )
     return (
         f"{lead} Read the files you need, edit them, and run the tests again. "
         "Re-check every acceptance criterion before you stop. "
@@ -119,6 +133,7 @@ def fix_prompt(
         f"Files mentioned in the traceback:\n{cited}\n\n"
         f"Test output:\n{test_output}\n\nTASK:\n{task}"
         f"{reminder}"
+        f"{lookup_block}"
     )
 
 
