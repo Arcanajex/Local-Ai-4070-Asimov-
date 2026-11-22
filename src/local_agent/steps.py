@@ -25,6 +25,14 @@ _HEADER = re.compile(
     re.IGNORECASE,
 )
 _FIELD = re.compile(r"^(goal|files|verify)[ \t]*:[ \t]*(.*)$", re.IGNORECASE)
+_FENCE_LANG = (
+    r"powershell|pwsh|ps1|bash|sh|shell|zsh|cmd|console|text|plaintext"
+)
+_FENCE_LANG_LINE = re.compile(rf"(?i)^(?:{_FENCE_LANG})$")
+_INLINE_FENCE = re.compile(
+    rf"(?i)^(`{{3,}})[ \t]*(?:(?:{_FENCE_LANG})[ \t]+)?(.*?)[ \t]*\1[ \t]*$"
+)
+_QUOTE_PAIRS = {"'": "'", '"': '"', "\u201c": "\u201d", "\u2018": "\u2019"}
 _EMPTY_FILES = {"", "none", "n/a", "na", "-", "(none)", "no files", "nothing", "n/a."}
 # The breakdown prompt shows this shape. An echo of the sample is not a step.
 _PLACEHOLDER_GOALS = {
@@ -139,9 +147,52 @@ def format_steps_markdown(steps: list[Step]) -> str:
 
 
 def commands_match(left: str, right: str) -> bool:
-    """True when two shell commands are the same aside from surrounding space."""
+    """True when two shell commands are the same aside from wrapping and space.
 
-    return " ".join((left or "").split()) == " ".join((right or "").split()) and bool((left or "").strip())
+    Both sides are normalised first, so a verify command wrapped in Markdown
+    backticks or quotes still matches the task test command.
+    """
+
+    normalized = " ".join(normalize_verify_command(left).split())
+    other = " ".join(normalize_verify_command(right).split())
+    return bool(normalized) and normalized == other
+
+
+def normalize_verify_command(text: str) -> str:
+    """Strip Markdown and quotes around a step verify command.
+
+    Fenced blocks (``` and ```powershell) become the body. Several command
+    lines become one `&&` chain, which the runner splits for PowerShell 5.1.
+    A command that is already plain text is returned unchanged.
+    """
+
+    value = (text or "").replace("\r\n", "\n").strip()
+    if not value:
+        return ""
+    for _ in range(6):
+        unfenced = _unwrap_fence(value)
+        if unfenced is not None and unfenced.strip() != value:
+            value = unfenced.strip()
+            continue
+        unwrapped = _unwrap_wrapping(value)
+        if unwrapped is not None and unwrapped.strip() != value:
+            value = unwrapped.strip()
+            continue
+        break
+    lines: list[str] = []
+    for raw in value.split("\n"):
+        line = raw.strip()
+        if not line or line.startswith("#") or re.fullmatch(r"`{3,}", line):
+            continue
+        if lines and lines[-1].endswith(("\\", "`")):
+            lines[-1] = lines[-1][:-1].rstrip() + " " + line
+            continue
+        lines.append(line)
+    if not lines:
+        return ""
+    if len(lines) == 1:
+        return lines[0]
+    return " && ".join(lines)
 
 
 def _extract(text: str) -> list[tuple[str, list[str], str]]:
@@ -169,7 +220,7 @@ def _extract(text: str) -> list[tuple[str, list[str], str]]:
 
 def _from_fields(block: str, remainder: str) -> tuple[str, list[str], str] | None:
     fields = _read_fields(block)
-    verify = fields.get("verify", "").strip()
+    verify = normalize_verify_command(fields.get("verify", ""))
     goal = fields.get("goal", "").strip() or _goal_from_remainder(remainder, has_verify=bool(verify))
     if not goal or not verify:
         return None
@@ -209,19 +260,115 @@ def _goal_from_remainder(remainder: str, *, has_verify: bool) -> str:
 
 def _read_fields(block: str) -> dict[str, str]:
     fields: dict[str, str] = {}
-    for raw in block.splitlines():
-        stripped = raw.strip().lstrip("-").strip()
+    lines = block.replace("\r\n", "\n").splitlines()
+    index = 0
+    while index < len(lines):
+        stripped = lines[index].strip().lstrip("-").strip()
         labels = re.findall(r"(?i)\b(?:goal|files|verify)\s*:", stripped)
         if len(labels) >= 2 and "|" in stripped:
             for part in stripped.split("|"):
                 match = _FIELD.match(part.strip())
                 if match:
                     fields[match.group(1).lower()] = match.group(2).strip()
+            index += 1
             continue
         match = _FIELD.match(stripped)
-        if match:
-            fields[match.group(1).lower()] = match.group(2).strip()
+        if not match:
+            index += 1
+            continue
+        name = match.group(1).lower()
+        value = match.group(2).strip()
+        if name == "verify":
+            value, index = _read_verify_value(value, lines, index)
+        fields[name] = value
+        index += 1
     return fields
+
+
+def _read_verify_value(value: str, lines: list[str], index: int) -> tuple[str, int]:
+    """Keep a fenced verify command that continues under the Verify: line."""
+
+    if not _verify_continues(value, lines, index):
+        return value, index
+    chunks = [value]
+    cursor = index
+    while cursor + 1 < len(lines):
+        nxt = lines[cursor + 1]
+        stripped = nxt.strip()
+        bare = stripped.lstrip("-").strip()
+        closed = _fence_balanced("\n".join(chunks))
+        if closed and (not stripped or _FIELD.match(bare) or _HEADER.match(stripped)):
+            break
+        if closed and not stripped.startswith("```"):
+            break
+        chunks.append(nxt)
+        cursor += 1
+        if _fence_balanced("\n".join(chunks)) and re.fullmatch(r"`{3,}", stripped):
+            break
+    return "\n".join(chunks).strip(), cursor
+
+
+def _fence_balanced(text: str) -> bool:
+    count = text.count("```")
+    return count > 0 and count % 2 == 0
+
+
+def _verify_continues(value: str, lines: list[str], index: int) -> bool:
+    if value.count("```") % 2 == 1:
+        return True
+    if index + 1 >= len(lines):
+        return False
+    return lines[index + 1].strip().startswith("```")
+
+
+def _unwrap_fence(value: str) -> str | None:
+    text = value.strip()
+    if not text.startswith("```"):
+        return None
+    lines = text.split("\n")
+    if len(lines) == 1:
+        match = _INLINE_FENCE.match(text)
+        if not match:
+            return None
+        return match.group(2).strip()
+    close_at = None
+    for cursor, line in enumerate(lines[1:], start=1):
+        if re.fullmatch(r"`{3,}", line.strip()):
+            close_at = cursor
+            break
+    if close_at is None:
+        body_lines = lines[1:]
+    else:
+        body_lines = lines[1:close_at]
+    info = re.sub(r"^`{3,}[ \t]*", "", lines[0].strip())
+    if _FENCE_LANG_LINE.match(info):
+        return "\n".join(body_lines).strip()
+    inline = re.match(rf"(?i)^(?:{_FENCE_LANG})[ \t]+(.+)$", info)
+    if inline:
+        extra = inline.group(1).strip()
+        body = "\n".join(body_lines).strip()
+        return f"{extra}\n{body}".strip() if body else extra
+    if info:
+        body = "\n".join(body_lines).strip()
+        return f"{info}\n{body}".strip() if body else info
+    return "\n".join(body_lines).strip()
+
+
+def _unwrap_wrapping(value: str) -> str | None:
+    text = value.strip()
+    if len(text) >= 2 and _QUOTE_PAIRS.get(text[0]) == text[-1]:
+        return text[1:-1]
+    if "\n" in text or len(text) < 2 or not text.startswith("`") or not text.endswith("`"):
+        return None
+    marks = 0
+    while marks < len(text) and text[marks] == "`":
+        marks += 1
+    if marks >= 3 or marks >= len(text) or not text.endswith("`" * marks):
+        return None
+    inner = text[marks:-marks]
+    if "`" in inner:
+        return None
+    return inner
 
 
 def _parse_files(value: str) -> list[str]:

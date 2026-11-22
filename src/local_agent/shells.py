@@ -22,6 +22,8 @@ import re
 import shlex
 import shutil
 import sys
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -112,6 +114,153 @@ def platform_shell_commands(command: str) -> list[str]:
     """Commands to run, in order, on bash or Windows PowerShell 5.1."""
 
     return [adapt_platform_command(part) for part in split_shell_chain(command)]
+
+
+# A shell that rejects the command (parse error, command not found) returns
+# before any test output. A real suite that happens to mention these phrases
+# is much longer than a diagnostic, so the short-output check stays narrow.
+_INVALID_COMMAND_SECONDS = 20
+_INVALID_OUTPUT = (
+    "parsererror",
+    "commandnotfoundexception",
+    "is not recognized as the name of a cmdlet",
+    "is not a valid statement separator",
+    "unexpectedtoken",
+    "not recognized as an internal or external command",
+    "syntax error near unexpected token",
+    "syntax error: unexpected end of file",
+)
+
+
+@dataclass
+class ShellChain:
+    ok: bool
+    output: str
+    invalid: bool
+    command: str
+
+
+def split_control_chain(command: str) -> list[tuple[str, str]]:
+    """Split on `&&` and `||` that sit outside quotes.
+
+    The first operator is "". A single `|` stays in the command: PowerShell
+    5.1 can pipe, and `dotnet test --filter Name~A|B` is not a chain.
+    `&&` / `||` inside quotes are not operators.
+    """
+
+    text = (command or "").strip()
+    if not text:
+        return []
+    parts: list[tuple[str, str]] = []
+    buf: list[str] = []
+    operator = ""
+    quote = ""
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if quote:
+            buf.append(char)
+            if char == quote:
+                # PowerShell escapes a single quote by doubling it.
+                if quote == "'" and index + 1 < len(text) and text[index + 1] == "'":
+                    buf.append("'")
+                    index += 2
+                    continue
+                quote = ""
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            buf.append(char)
+            index += 1
+            continue
+        if text.startswith("&&", index) or text.startswith("||", index):
+            segment = "".join(buf).strip()
+            if segment:
+                parts.append((operator, segment))
+            operator = text[index : index + 2]
+            buf = []
+            index += 2
+            continue
+        buf.append(char)
+        index += 1
+    tail = "".join(buf).strip()
+    if tail:
+        parts.append((operator, tail))
+    elif not parts:
+        return []
+    return parts
+
+
+def shell_output_is_invalid(output: str) -> bool:
+    """True when the shell rejected the command instead of running a program.
+
+    PowerShell 5.1 parse errors and command-not-found, and bash's
+    command-not-found (exit 127) or syntax error. A test process that exits
+    non-zero does not match. A timed-out run is a real failure.
+    """
+
+    text = output or ""
+    if re.search(r"(?m)^timed_out:\s*true\b", text):
+        return False
+    if re.search(r"(?m)^exit_code:\s*127\s*$", text):
+        return True
+    body = text.split("--- output ---", 1)[-1]
+    lowered = body.lower()
+    if any(needle in lowered for needle in _INVALID_OUTPUT):
+        return True
+    if "command not found" in lowered and len(body) < 800:
+        return True
+    return False
+
+
+def run_shell_chain(command: str, *, cwd: Path, timeout: int) -> ShellChain:
+    """Run a verify command, including `&&` / `||`, on bash and PowerShell 5.1.
+
+    PowerShell 5.1 has neither operator. Each segment is its own process, in
+    the project root. A failed segment skips the next `&&` command. A
+    successful segment skips the next `||` command. The same split is used
+    on bash: `exit` inside `bash -lc` would otherwise leave the shell before
+    the next operator runs, and separate processes keep both CI jobs on the
+    same rules.
+    A segment the shell rejects is `invalid` so the caller can fall back to
+    the task test command instead of counting a step failure.
+    """
+
+    from local_agent.tools import run_command
+
+    text = (command or "").strip()
+    segments = split_control_chain(text)
+    if not segments:
+        return ShellChain(ok=False, output="", invalid=True, command=text)
+    blocks: list[str] = []
+    ok = False
+    invalid = False
+    previous: bool | None = None
+    for operator, segment in segments:
+        if previous is not None and not _chain_should_run(operator, previous):
+            continue
+        adapted = adapt_platform_command(segment)
+        started = time.monotonic()
+        ran = run_command(adapted, cwd=cwd, timeout=timeout)
+        elapsed = time.monotonic() - started
+        blocks.append(f"$ {adapted}\n{ran.output}")
+        ok = ran.ok
+        previous = ok
+        if not ok and elapsed <= _INVALID_COMMAND_SECONDS and shell_output_is_invalid(ran.output):
+            invalid = True
+            break
+    return ShellChain(ok=ok, output="\n\n".join(blocks), invalid=invalid, command=text)
+
+
+def _chain_should_run(operator: str, previous_ok: bool) -> bool:
+    """Left-associative `&&` / `||`, matching bash once `exit` is not inlined."""
+
+    if operator == "&&":
+        return previous_ok
+    if operator == "||":
+        return not previous_ok
+    return True
 
 
 def find_posix_shell() -> str | None:

@@ -77,6 +77,7 @@ from local_agent.steps import (
     commands_match,
     format_step_list,
     format_steps_markdown,
+    normalize_verify_command,
     parse_steps,
     resolve_step_settings,
 )
@@ -107,7 +108,7 @@ from local_agent.test_first import (
     restore_rels,
     snapshot_tree,
 )
-from local_agent.shells import platform_shell_commands
+from local_agent.shells import platform_shell_commands, run_shell_chain
 from local_agent.tools import Workspace, clear_bytecode, run_command
 from local_agent.traceback_files import format_traceback_files
 
@@ -1501,7 +1502,8 @@ def _run_step_attempt(
     """One implement plus its fix rounds. Returns passed, failed, or time_budget."""
 
     files = ", ".join(step.files)
-    use_suite = (not step.verify.strip()) or commands_match(step.verify, test_command)
+    verify_command = normalize_verify_command(step.verify)
+    use_suite = (not verify_command) or commands_match(verify_command, test_command)
     paths = tuple(dict.fromkeys((*work_guard.plan_paths, *step.files)))
     guard = replace(work_guard, plan_paths=paths)
     phase = f"step-{step.index}" if attempt == 1 else f"step-{step.index}-retry"
@@ -1520,7 +1522,7 @@ def _run_step_attempt(
             total=total,
             goal=step.goal,
             files=files,
-            verify=step.verify or test_command,
+            verify=verify_command or test_command,
             previous_failure=shrink_text(previous_failure, 4000),
         ),
         allowed=None,
@@ -1548,7 +1550,7 @@ def _run_step_attempt(
             index=step.index,
             goal=step.goal,
             files=files,
-            verify=step.verify or test_command,
+            verify=verify_command or test_command,
         )
         body = _fix_user_prompt(
             task,
@@ -1596,22 +1598,33 @@ def _run_step_gate(
     """Run the step's verify command.
 
     When that command is the task test command, also run lint and the task's
-    verify_commands. A targeted verify does not pull those in.
+    verify_commands. A targeted verify does not pull those in. `&&` / `||`
+    are split so Windows PowerShell 5.1 can run them. A command the shell
+    rejects at once (parse error, command not found) is not a step failure:
+    the task test command runs instead.
     """
 
-    if use_suite:
-        output, ok = _run_checks(project, test_command, lint_command)
-        if ok and task.verify_commands:
-            results = _run_verify_commands(task.verify_commands, project, task.verify_timeout)
-            verify_ok = all(item.ok for item in results)
-            output = output + "\n\n" + _format_verify_log(results, verify_ok)
-            ok = verify_ok
-        command = test_command
+    command = normalize_verify_command(step.verify)
+    suite = use_suite or (not command) or commands_match(command, test_command)
+    if not suite:
+        ran = run_shell_chain(command, cwd=project, timeout=max(1, task.verify_timeout))
+        if ran.invalid:
+            logger.event(
+                "step_verify_invalid",
+                index=step.index,
+                command=command,
+                summary=f"step_verify_invalid {step.index}: {command[:160]}",
+            )
+            ok, output, command = _run_task_checks(project, task, test_command, lint_command)
+            output = (
+                "The step verify command was not a valid shell command, "
+                "so the task test command ran instead.\n" + output
+            )
+        else:
+            ok = ran.ok
+            output = ran.output
     else:
-        command = step.verify.strip()
-        ran = run_command(command, cwd=project, timeout=max(1, task.verify_timeout))
-        output = f"$ {command}\n{ran.output}"
-        ok = ran.ok
+        ok, output, command = _run_task_checks(project, task, test_command, lint_command)
     logger.event(
         "step_check",
         index=step.index,
@@ -1620,6 +1633,23 @@ def _run_step_gate(
         summary=f"step_check {step.index} passed={ok}",
     )
     return ok, output
+
+
+def _run_task_checks(
+    project: Path,
+    task: TaskSpec,
+    test_command: str,
+    lint_command: str | None,
+) -> tuple[bool, str, str]:
+    """Task test command, then lint, then verify_commands when those passed."""
+
+    output, ok = _run_checks(project, test_command, lint_command)
+    if ok and task.verify_commands:
+        results = _run_verify_commands(task.verify_commands, project, task.verify_timeout)
+        verify_ok = all(item.ok for item in results)
+        output = output + "\n\n" + _format_verify_log(results, verify_ok)
+        ok = verify_ok
+    return ok, output, test_command
 
 
 def _remember_step_files(
@@ -1975,8 +2005,14 @@ def _run_phase(
     guard: PhaseGuard | None = None,
 ) -> PhaseResult:
     logger.event("phase_start", phase=phase, max_turns=max_turns, summary=phase)
+    planning = phase == "step-plan" or phase.startswith("step-replan")
     harness = AgentHarness(
-        client, workspace, logger, profile, allowed_tools=allowed
+        client,
+        workspace,
+        logger,
+        profile,
+        allowed_tools=allowed,
+        pending_missing_reads=planning,
     )
     result = harness.run(prompt, max_turns=max_turns, deadline=deadline, guard=guard)
     logger.event("phase_end", phase=phase, status=result.status, summary=f"{phase} {result.status}")

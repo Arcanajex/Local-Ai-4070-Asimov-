@@ -20,6 +20,9 @@ from local_agent.shells import (
     format_shell_command,
     platform_shell_commands,
     python_shell,
+    run_shell_chain,
+    shell_output_is_invalid,
+    split_control_chain,
 )
 from local_agent.smoke_gate import run_smoke
 from local_agent.tools import run_command
@@ -74,6 +77,82 @@ def test_verify_commands_split_and_and_and_quote_a_windows_path(monkeypatch):
     assert already.startswith("& ")
     monkeypatch.setattr(shells.os, "name", "posix")
     assert shells.adapt_platform_command(quoted) == quoted
+
+
+def test_control_chain_keeps_pipes_and_quoted_operators():
+    assert split_control_chain("exit 0 && exit 1") == [("", "exit 0"), ("&&", "exit 1")]
+    assert split_control_chain("exit 1 || exit 0") == [("", "exit 1"), ("||", "exit 0")]
+    assert split_control_chain("exit 1 && exit 0 || exit 0") == [
+        ("", "exit 1"),
+        ("&&", "exit 0"),
+        ("||", "exit 0"),
+    ]
+    assert split_control_chain("dotnet test --filter Name~A|B") == [
+        ("", "dotnet test --filter Name~A|B")
+    ]
+    quoted = 'python -c "print(1 && 2)"'
+    assert split_control_chain(quoted) == [("", quoted)]
+    assert split_control_chain("exit 0 && " + quoted) == [("", "exit 0"), ("&&", quoted)]
+
+
+def test_shell_rejection_is_not_a_test_failure():
+    parser = (
+        "exit_code: 1\n"
+        "timed_out: false\n"
+        "--- output ---\n"
+        "At line:1 char:12\n"
+        "+ dotnet test && dotnet build\n"
+        "The token '&&' is not a valid statement separator in this version.\n"
+        "    + CategoryInfo          : ParserError: (:) [], ParentContainsErrorRecordException\n"
+        "    + FullyQualifiedErrorId : InvalidEndOfLine\n"
+    )
+    missing = (
+        "exit_code: 1\n"
+        "timed_out: false\n"
+        "--- output ---\n"
+        "not-a-real : The term 'not-a-real' is not recognized as the name of a cmdlet, "
+        "function, script file, or operable program.\n"
+        "    + FullyQualifiedErrorId : CommandNotFoundException\n"
+    )
+    assert shell_output_is_invalid(parser)
+    assert shell_output_is_invalid(missing)
+    assert not shell_output_is_invalid(
+        "exit_code: 1\ntimed_out: false\n--- output ---\nFailed! - Failed: 1\n"
+    )
+    assert not shell_output_is_invalid("exit_code: 1\ntimed_out: true\n--- output ---\nParserError\n")
+    long_log = "exit_code: 1\ntimed_out: false\n--- output ---\n" + ("command not found\n" * 50)
+    assert not shell_output_is_invalid(long_log)
+
+
+def test_and_and_or_run_in_sequence_on_this_platform(tmp_path):
+    failed = run_shell_chain(f"{command_succeeds()} && {command_fails()}", cwd=tmp_path, timeout=30)
+    assert not failed.ok and not failed.invalid
+    assert [line for line in failed.output.splitlines() if line.startswith("$ ")] == [
+        "$ " + command_succeeds(),
+        "$ " + command_fails(),
+    ]
+
+    skipped = run_shell_chain(
+        f"{command_fails()} && {command_succeeds()} || {command_succeeds()}",
+        cwd=tmp_path,
+        timeout=30,
+    )
+    assert skipped.ok and not skipped.invalid
+    assert [line for line in skipped.output.splitlines() if line.startswith("$ ")] == [
+        "$ " + command_fails(),
+        "$ " + command_succeeds(),
+    ]
+
+    passed = run_shell_chain(f"{command_succeeds()} || {command_fails()}", cwd=tmp_path, timeout=30)
+    assert passed.ok and not passed.invalid
+    assert [line for line in passed.output.splitlines() if line.startswith("$ ")] == [
+        "$ " + command_succeeds()
+    ]
+
+    missing = run_shell_chain("not-a-real-command-zz-local-agent", cwd=tmp_path, timeout=30)
+    assert not missing.ok and missing.invalid
+    genuine = run_shell_chain(command_fails(), cwd=tmp_path, timeout=30)
+    assert not genuine.ok and not genuine.invalid
 
 
 def test_bash_quotes_without_a_call_operator(monkeypatch):
