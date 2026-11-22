@@ -4,13 +4,29 @@ from __future__ import annotations
 
 import json
 import subprocess
+import time
 from pathlib import Path
 
 from local_agent.client import ChatResult, ToolCall
 from local_agent.config import get_profile, write_override
-from local_agent.overnight import apply_project_defaults, load_task, parse_task, run_overnight
+from local_agent.logging_util import RunLogger
+from local_agent.overnight import (
+    _run_phase,
+    _run_step_gate,
+    apply_project_defaults,
+    load_task,
+    parse_task,
+    run_overnight,
+)
 from local_agent.shells import command_fails, command_succeeds, python_shell
-from local_agent.steps import commands_match, parse_steps, resolve_step_settings
+from local_agent.steps import (
+    Step,
+    commands_match,
+    normalize_verify_command,
+    parse_steps,
+    resolve_step_settings,
+)
+from local_agent.tools import PENDING_FILE_NOTE, Workspace
 
 
 GOOD_REVIEW = (
@@ -78,6 +94,215 @@ def test_parse_steps_accepts_shapes_and_drops_a_plain_plan():
     assert [step.index for step in restarted] == [3, 4]
     assert commands_match("  exit   0 ", "exit 0")
     assert not commands_match("exit 0", "exit 1")
+
+
+def test_parse_steps_strips_markdown_quotes_and_joins_command_lines():
+    wrapped = parse_steps(
+        "### Step 1\nGoal: Run the suite\nFiles: none\nVerify: `dotnet test`\n"
+    )
+    assert wrapped[0].verify == "dotnet test"
+
+    quoted = parse_steps(
+        '### Step 1\nGoal: Run the suite\nFiles: none\nVerify: "dotnet test"\n'
+    )
+    assert quoted[0].verify == "dotnet test"
+    single = parse_steps(
+        "### Step 1\nGoal: Build\nFiles: none\nVerify: 'dotnet build'\n"
+    )
+    assert single[0].verify == "dotnet build"
+
+    fenced = parse_steps(
+        "### Step 1\nGoal: Run the suite\nFiles: a.cs\n"
+        "Verify: ```powershell\n"
+        "dotnet test\n"
+        "```\n"
+    )
+    assert fenced[0].verify == "dotnet test"
+    assert fenced[0].files == ["a.cs"]
+
+    two_lines = parse_steps(
+        "### Step 2\nGoal: Build then test\nFiles: a.cs\n"
+        "Verify: ```\n"
+        "dotnet build\n"
+        "dotnet test\n"
+        "```\n"
+        "\n"
+        "### Step 3\nGoal: Ship\nFiles: b.cs\nVerify: dotnet test\n"
+    )
+    assert [step.verify for step in two_lines] == ["dotnet build && dotnet test", "dotnet test"]
+    assert two_lines[1].goal == "Ship"
+
+    assert normalize_verify_command('  `"dotnet test"`  ') == "dotnet test"
+    assert normalize_verify_command("dotnet build\ndotnet test") == "dotnet build && dotnet test"
+    assert normalize_verify_command("dotnet test \\\n--filter Name~A") == "dotnet test --filter Name~A"
+    assert normalize_verify_command("dotnet test --filter Name~A|B") == "dotnet test --filter Name~A|B"
+    powershell = "& 'C:\\Program Files\\python.exe' -m pytest -q"
+    assert normalize_verify_command(powershell) == powershell
+    assert normalize_verify_command(f"`{powershell}`") == powershell
+
+    assert commands_match("`dotnet test`", "dotnet test")
+    assert commands_match("```powershell\ndotnet test\n```", '"dotnet test"')
+    assert commands_match("  `exit   0` ", "exit 0")
+    assert not commands_match("dotnet test", "dotnet build")
+    assert not commands_match("", "dotnet test")
+    assert not commands_match("   ", "   ")
+
+    echoed = parse_steps(
+        "### Step 1\nGoal: what this step makes true\nFiles: a.cs\n"
+        "Verify: `the one command for this step`\n"
+    )
+    assert echoed == []
+
+
+def test_malformed_verify_falls_back_and_a_real_failure_does_not(tmp_path):
+    project = tmp_path / "repo"
+    project.mkdir()
+    task = parse_task(f"---\ntest_command: {command_succeeds()}\n---\n# t\n")
+    task.verify_timeout = 30
+    logger = RunLogger(tmp_path / "logs")
+    try:
+        missing = parse_steps(
+            "### Step 1\nGoal: Check\nFiles: none\nVerify: `not-a-real-command-zz-local-agent`\n"
+        )[0]
+        assert missing.verify == "not-a-real-command-zz-local-agent"
+        ok, output = _run_step_gate(
+            project, task, missing, task.test_command, None, False, logger
+        )
+        assert ok, output
+        text = (tmp_path / "logs" / "events.log").read_text(encoding="utf-8")
+        assert "step_verify_invalid" in text
+        assert "passed=True" in text or "passed=true" in text
+
+        genuine = parse_steps(
+            f"### Step 1\nGoal: Check\nFiles: none\nVerify: {command_fails()}\n"
+        )[0]
+        ok, output = _run_step_gate(
+            project, task, genuine, task.test_command, None, False, logger
+        )
+        assert not ok, output
+        text = (tmp_path / "logs" / "events.log").read_text(encoding="utf-8")
+        invalids = [line for line in text.splitlines() if "step_verify_invalid" in line]
+        assert len(invalids) == 1
+
+        chained_fail = parse_steps(
+            "### Step 1\nGoal: Check\nFiles: none\n"
+            f"Verify: {command_succeeds()} && {command_fails()}\n"
+        )[0]
+        # The task command succeeds. Falling back would hide this real failure.
+        ok, output = _run_step_gate(
+            project, task, chained_fail, task.test_command, None, False, logger
+        )
+        assert not ok, output
+        assert "$ " + command_fails() in output
+
+        task_fails = parse_task(f"---\ntest_command: {command_fails()}\n---\n# t\n")
+        task_fails.verify_timeout = 30
+        recovered = parse_steps(
+            "### Step 1\nGoal: Check\nFiles: none\n"
+            f"Verify: {command_fails()} || {command_succeeds()}\n"
+        )[0]
+        ok, output = _run_step_gate(
+            project, task_fails, recovered, task_fails.test_command, None, False, logger
+        )
+        assert ok, output
+        text = (tmp_path / "logs" / "events.log").read_text(encoding="utf-8")
+        assert len([line for line in text.splitlines() if "step_verify_invalid" in line]) == 1
+
+        # Backticks are stripped before the shell sees the command. The task
+        # command fails, so a fallback would not pass.
+        echoed = Step(index=1, goal="Check", files=[], verify="`echo hi-from-verify`")
+        ok, output = _run_step_gate(
+            project, task_fails, echoed, task_fails.test_command, None, False, logger
+        )
+        assert ok, output
+        assert "hi-from-verify" in output
+        text = (tmp_path / "logs" / "events.log").read_text(encoding="utf-8")
+        assert len([line for line in text.splitlines() if "step_verify_invalid" in line]) == 1
+    finally:
+        logger.close()
+
+
+def test_step_plan_read_of_a_missing_file_is_pending(tmp_path):
+    project = tmp_path / "repo"
+    project.mkdir()
+    (project / "keep.txt").write_text("here\n", encoding="utf-8")
+    logger = RunLogger(tmp_path / "logs")
+
+    class Client:
+        def __init__(self):
+            self.turn = 0
+
+        def chat(self, messages, *, tools, max_tokens):
+            self.turn += 1
+            if self.turn == 1:
+                return _call("read", {"path": "BrandNew.cs"})
+            if self.turn == 2:
+                return _call("read", {"path": "keep.txt"})
+            return _text("### Step 1\nGoal: Add it\nFiles: BrandNew.cs\nVerify: exit 0\n")
+
+    try:
+        result = _run_phase(
+            Client(),
+            Workspace(project),
+            logger,
+            _day(),
+            "Split the plan into small verified steps.",
+            allowed={"read", "list_files"},
+            max_turns=4,
+            deadline=time.monotonic() + 30,
+            phase="step-plan",
+        )
+        assert result.status == "completed"
+        events = [
+            json.loads(line)
+            for line in (tmp_path / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        reads = [item for item in events if item.get("kind") == "tool_result" and item.get("name") == "read"]
+        assert len(reads) == 2
+        assert reads[0]["ok"] is True
+        assert f"BrandNew.cs: {PENDING_FILE_NOTE}" in reads[0]["output"]
+        assert "file not found" not in reads[0]["output"]
+        assert reads[1]["ok"] is True
+        assert "here" in reads[1]["output"]
+
+        class Implement:
+            def __init__(self):
+                self.done = False
+
+            def chat(self, messages, *, tools, max_tokens):
+                if not self.done:
+                    self.done = True
+                    return _call("read", {"path": "BrandNew.cs"})
+                return _text("done")
+
+        later = _run_phase(
+            Implement(),
+            Workspace(project),
+            logger,
+            _day(),
+            "Implement this step only.",
+            allowed={"read", "list_files"},
+            max_turns=3,
+            deadline=time.monotonic() + 30,
+            phase="step-1",
+        )
+        assert later.status == "completed"
+        events = [
+            json.loads(line)
+            for line in (tmp_path / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        implement_reads = [
+            item
+            for item in events
+            if item.get("kind") == "tool_result"
+            and item.get("name") == "read"
+            and "BrandNew.cs" in str(item.get("output"))
+            and item.get("ok") is False
+        ]
+        assert implement_reads
+        assert "file not found" in implement_reads[-1]["output"]
+    finally:
+        logger.close()
 
 
 def test_step_settings_follow_task_then_agents_then_profile(tmp_path):

@@ -47,6 +47,11 @@ class ToolResult:
     hits: int | None = None
 
 
+# A step planner often reads a file the step is about to create. An error
+# makes the model retry the same read until the turn budget is gone.
+PENDING_FILE_NOTE = "file does not exist yet (will be created)"
+
+
 def shell_description() -> str:
     if os.name == "nt":
         return (
@@ -210,12 +215,23 @@ class Workspace:
             raise ValueError(f"path escapes the project root: {raw_path}") from exc
         return full
 
-    def read(self, path: str, offset: int = 1, limit: int = MAX_READ_LINES) -> ToolResult:
+    def read(
+        self,
+        path: str,
+        offset: int = 1,
+        limit: int = MAX_READ_LINES,
+        *,
+        missing_as_pending: bool = False,
+    ) -> ToolResult:
         try:
             target = self.resolve(path)
         except ValueError as exc:
             return ToolResult(False, str(exc))
         if not target.is_file():
+            if missing_as_pending and not target.exists():
+                name = path.strip() if isinstance(path, str) else ""
+                note = f"{name}: {PENDING_FILE_NOTE}" if name else PENDING_FILE_NOTE
+                return ToolResult(True, note)
             return ToolResult(False, f"file not found: {path}")
         try:
             text = target.read_text(encoding="utf-8")
@@ -582,7 +598,13 @@ def _lookup_api(workspace: Workspace, query: Any) -> ToolResult:
     return ToolResult(True, result.text or "No matching public API.", hits=result.hits)
 
 
-def dispatch(name: str, arguments: dict[str, Any], workspace: Workspace) -> ToolResult:
+def dispatch(
+    name: str,
+    arguments: dict[str, Any],
+    workspace: Workspace,
+    *,
+    missing_as_pending: bool = False,
+) -> ToolResult:
     arguments = arguments or {}
     try:
         if name == "read":
@@ -590,6 +612,7 @@ def dispatch(name: str, arguments: dict[str, Any], workspace: Workspace) -> Tool
                 arguments.get("path", ""),
                 offset=int(arguments.get("offset") or 1),
                 limit=int(arguments.get("limit") or MAX_READ_LINES),
+                missing_as_pending=missing_as_pending,
             )
         if name == "list_files":
             return workspace.list_files(str(arguments.get("path") or "."))

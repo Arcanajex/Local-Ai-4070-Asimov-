@@ -3,7 +3,21 @@
 from __future__ import annotations
 
 from local_agent.shells import python_shell
-from local_agent.tools import Workspace, blocked_command_reason, tool_schemas
+from local_agent.tools import PENDING_FILE_NOTE, Workspace, blocked_command_reason, tool_schemas
+
+
+def test_planning_read_of_a_missing_file_is_pending(tmp_path):
+    workspace = Workspace(tmp_path)
+    missing = workspace.read("BrandNew.cs", missing_as_pending=True)
+    assert missing.ok
+    assert missing.output == f"BrandNew.cs: {PENDING_FILE_NOTE}"
+    still_missing = workspace.read("BrandNew.cs")
+    assert not still_missing.ok
+    assert still_missing.output == "file not found: BrandNew.cs"
+    (tmp_path / "keep.txt").write_text("here\n", encoding="utf-8")
+    kept = workspace.read("keep.txt", missing_as_pending=True)
+    assert kept.ok
+    assert "here" in kept.output
 
 
 def test_write_read_edit_round_trip(tmp_path):

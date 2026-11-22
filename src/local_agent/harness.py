@@ -53,12 +53,16 @@ class AgentHarness:
         profile: Profile,
         *,
         allowed_tools: set[str] | None = None,
+        pending_missing_reads: bool = False,
     ):
         self.client = client
         self.workspace = workspace
         self.logger = logger
         self.profile = profile
         self.allowed_tools = allowed_tools
+        # Step planning reads files the step has not created yet. Those reads
+        # are a result, not an error, so the model does not retry them.
+        self.pending_missing_reads = pending_missing_reads
 
     def run(
         self,
@@ -337,7 +341,12 @@ class AgentHarness:
             return blocked, False, explored or call.name == "shell", False
         if self.allowed_tools is not None and call.name not in self.allowed_tools:
             return f"tool {call.name} is not available in this phase", False, explored, False
-        tool_result = dispatch(call.name, call.arguments, self.workspace)
+        tool_result = dispatch(
+            call.name,
+            call.arguments,
+            self.workspace,
+            missing_as_pending=self.pending_missing_reads and call.name == "read",
+        )
         if call.name == "lookup_api":
             self._log_api_index()
             query = str((call.arguments or {}).get("query") or "")
