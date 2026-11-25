@@ -13,6 +13,30 @@ from pathlib import Path
 from typing import Any
 
 
+def append_event(directory: Path, kind: str, **payload: Any) -> None:
+    """Append one event without holding the log file open.
+
+    The queue watchdog and the memory guard write here from outside the task's
+    own ``RunLogger``, which may already have the attempt log open.
+    """
+
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "kind": kind,
+        **payload,
+    }
+    line = json.dumps(record, ensure_ascii=False, default=str) + "\n"
+    with (directory / "events.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(line)
+        handle.flush()
+    summary = payload.get("summary") or payload.get("status") or ""
+    with (directory / "events.log").open("a", encoding="utf-8") as handle:
+        handle.write(f"{record['ts']} {kind} {summary}\n")
+        handle.flush()
+
+
 class RunLogger:
     def __init__(self, directory: Path):
         self.directory = Path(directory)

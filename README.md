@@ -336,15 +336,22 @@ Optional front matter, all unset by default except the turn budgets and the expl
 | `step_replans` | `1` | How many times a step that failed twice may replan the remaining work. `0` stops at the second failure. Clamped to 0–3. |
 | `api_lookup` | `true` | Index referenced NuGet packages and expose `lookup_api`. On a CS1061, CS1503, CS0117, CS7036, or similar error, the fix prompt gets the real signatures. Set `false` to turn that off. |
 | `api_lookup_budget` | `1600` | Characters kept from one lookup. Clamped to 200–4000. |
+| `memory_min_available_mb` | `512` | Pause before a task or a step when available physical memory is below this many megabytes. `0` disables this check. |
+| `memory_min_commit_mb` | `1536` | Same, for commit headroom (page file plus RAM, minus what is already committed). `0` disables this check. |
+| `memory_wait_seconds` | `60` | How long to poll for memory to recover before pausing. Capped at 900. `0` pauses on the first low reading. |
+| `memory_poll_seconds` | `5` | Seconds between those readings. |
+| `shared_compilation` | `false` | When `false`, child processes get `UseSharedCompilation=false`, `MSBUILDDISABLENODEREUSE=1`, and `DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER=1` so VBCSCompiler and the MSBuild server do not stay up after a command. |
+| `shutdown_dotnet_build_server` | `true` | After a timed-out command whose text contains `dotnet`, run `dotnet build-server shutdown` (10s cap). Missing `dotnet` is ignored. |
+| `watchdog_minutes` | `30` | Queue only. If a running task writes no events for this many minutes, kill its process tree, mark it `watchdog_timeout`, and start the next task. Independent of the per-task time budget. `0` disables it. |
 
 The same numeric keys can sit on the profile in `profiles\models.json` or under that profile in `runtime\overrides.json`. A value in the task file wins over the profile. Passing an explicit turn budget to the Python function (the tests and the eval runner do this) wins over the task file. See [docs/TASK_TEMPLATE.md](docs/TASK_TEMPLATE.md).
 
-Shell commands the model issues are killed at 120 seconds unless it passes a lower `timeout_seconds`. The hard cap is 600 seconds. `git push`, `git reset --hard`, `git clean`, `shutdown`, `diskpart`, and `rm -rf /` are refused. That list is a tripwire for an unattended run, not a sandbox: the model can run anything you can run.
+Shell commands the model issues, and the test, smoke, verify, and step-gate commands the runner issues itself, are killed at 120 seconds unless a tool call passes a lower `timeout_seconds`. The hard cap on a model shell call is 600 seconds. The kill covers the whole tree: a Windows job object with `KILL_ON_JOB_CLOSE` (then `taskkill /F /T` if the job cannot be created), or a new session and `killpg` on Linux. Stdout and stderr are read on threads and abandoned after a couple of seconds, so a grandchild that still holds a pipe cannot keep the harness blocked after the timeout. The output is marked `timed_out: true` and `killed after Ns`, and `pipes_abandoned: true` when the unread tail was dropped. `git push`, `git reset --hard`, `git clean`, `shutdown`, `diskpart`, and `rm -rf /` are refused. That list is a tripwire for an unattended run, not a sandbox: the model can run anything you can run.
 
 Logs:
 
 - `runtime\logs\overnight-*.log` is the PowerShell transcript.
-- `runtime\logs\run-*\events.jsonl` is every model turn. `events.log` is the same stream as one line per event. Step runs log `step_start`, `step_pass`, `step_fail`, and `replan` with the step index.
+- `runtime\logs\run-*\events.jsonl` is every model turn. `events.log` is the same stream as one line per event. Step runs log `step_start`, `step_pass`, `step_fail`, and `replan` with the step index. A memory pause logs `low_memory` (`action` `wait`, `recovered`, `pause`, or `unreadable`). A queue watchdog logs `watchdog_timeout`.
 
 ## Project context and the task template
 
@@ -420,6 +427,16 @@ What it does:
 7. `queue-summary.md` in the task folder lists every task, then which files were archived and which stayed. When the queue ends, Windows shows a toast and plays a beep. If the toast cannot be shown, the script warns and still exits with the real result.
 
 `-InitRepo` and `-MaxHoursPerTask` match the overnight switches. `-MaxHoursPerTask` is the budget for each file, not the whole queue.
+
+Before each task, and again before each step and before the test command, the runner reads available physical memory and commit headroom. Windows uses `GlobalMemoryStatusEx`. Linux uses `/proc/meminfo` (`MemAvailable`, and `CommitLimit` minus `Committed_AS`). If either floor is missed, it logs `low_memory`, polls for `memory_wait_seconds`, and if headroom does not come back it ends that task as `paused_low_memory` and does not start another file. The task file stays where it is, so the next queue run picks it up. `continue_on_failure` does not skip a memory pause. The task wins, then `AGENTS.md`, then the profile. `0` on a floor turns that check off.
+
+Separately, the queue watches the task log. If no `events.jsonl` grows for `watchdog_minutes` (default 30, or `--watchdog-minutes` / `-WatchdogMinutes`), it logs `watchdog_timeout`, kills that task's process tree, marks the task `watchdog_timeout`, and continues with the next file. This clock is not the per-task `--max-hours-per-task` budget. `0` disables it.
+
+On Windows the harness calls `SetErrorMode` before it starts a child, with `SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX`. Children inherit that mode, which suppresses the modal "Unknown Hard Error" dialog from an out-of-memory `dotnet.exe` or `testhost.exe`. Children also get `DOTNET_DbgEnableMiniDump=0` and `COMPlus_DbgEnableMiniDump=0`. The harness does not edit the registry. An optional machine-wide tweak, which needs an administrator and is not applied for you, is:
+
+```text
+reg add "HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting" /v DontShowUI /t REG_DWORD /d 1 /f
+```
 
 Stop the queue after the task that is running, so you can shut the server down without waiting for the rest of the folder. From another PowerShell window:
 

@@ -10,11 +10,11 @@ from __future__ import annotations
 
 import os
 import re
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from local_agent.procman import kill_process_tree, run_shell
 from local_agent.repo_map import format_file_list
 
 MAX_READ_LINES = 400
@@ -56,12 +56,12 @@ def shell_description() -> str:
     if os.name == "nt":
         return (
             "Run one PowerShell command in the project root. "
-            "The process is killed after timeout_seconds (default 120, max 600). "
+            "The process tree is killed after timeout_seconds (default 120, max 600). "
             "Do not start a server or anything else you need to keep alive."
         )
     return (
         "Run one bash command in the project root. "
-        "The process is killed after timeout_seconds (default 120, max 600). "
+        "The process tree is killed after timeout_seconds (default 120, max 600). "
         "Do not start a server or anything else you need to keep alive."
     )
 
@@ -491,72 +491,22 @@ def _clamp_timeout(timeout_seconds: int | None) -> int:
 
 
 def run_command(command: str, *, cwd: Path, timeout: int) -> ToolResult:
-    if os.name == "nt":
-        argv = [
-            "powershell.exe",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            command,
-        ]
-        popen_kwargs: dict[str, Any] = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
-    else:
-        argv = ["/bin/bash", "-lc", command]
-        popen_kwargs = {"start_new_session": True}
-    env = os.environ.copy()
-    # Don't write .pyc from agent commands. Combined with invalidate_bytecode,
-    # a test rerun in the same second cannot keep executing the previous file.
-    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    # PYTHONDONTWRITEBYTECODE is set on the child by procman. Combined with
+    # invalidate_bytecode, a test rerun in the same second cannot keep
+    # executing the previous file.
     try:
-        proc = subprocess.Popen(
-            argv,
-            cwd=str(cwd),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=env,
-            **popen_kwargs,
-        )
-    except FileNotFoundError as exc:
+        captured = run_shell(command, cwd=cwd, timeout=timeout)
+    except OSError as exc:
         return ToolResult(False, f"failed to start shell: {exc}")
-    timed_out = False
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        kill_process_tree(proc)
-        stdout, stderr = proc.communicate()
     output = _format_shell_output(
-        exit_code=proc.returncode if proc.returncode is not None else -1,
-        timed_out=timed_out,
-        stdout=stdout or "",
-        stderr=stderr or "",
+        exit_code=captured.returncode,
+        timed_out=captured.timed_out,
+        stdout=captured.stdout,
+        stderr=captured.stderr,
         timeout=timeout,
+        pipes_abandoned=captured.pipes_abandoned,
     )
-    return ToolResult(not timed_out and proc.returncode == 0, output)
-
-
-def kill_process_tree(proc: subprocess.Popen[str]) -> None:
-    if os.name == "nt":
-        subprocess.run(
-            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        return
-    try:
-        os.killpg(proc.pid, 15)
-    except (ProcessLookupError, PermissionError, OSError):
-        proc.kill()
-        return
-    try:
-        proc.wait(timeout=2)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(proc.pid, 9)
-        except (ProcessLookupError, PermissionError, OSError):
-            proc.kill()
+    return ToolResult(not captured.timed_out and captured.returncode == 0, output)
 
 
 def _format_shell_output(
@@ -566,6 +516,7 @@ def _format_shell_output(
     stdout: str,
     stderr: str,
     timeout: int,
+    pipes_abandoned: bool = False,
 ) -> str:
     combined = stdout
     if stderr:
@@ -573,6 +524,8 @@ def _format_shell_output(
     combined = _cap_output(combined, SHELL_OUTPUT_CHARS)
     status = "timed_out: true" if timed_out else "timed_out: false"
     note = f"\nkilled after {timeout}s" if timed_out else ""
+    if pipes_abandoned:
+        note += "\npipes_abandoned: true"
     return f"exit_code: {exit_code}\n{status}{note}\n--- output ---\n{combined}"
 
 
