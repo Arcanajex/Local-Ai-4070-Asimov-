@@ -39,7 +39,28 @@ import time
 from pathlib import Path
 
 pidfile = Path(sys.argv[1])
-grand = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+beat = Path(sys.argv[2]) if len(sys.argv) > 2 else None
+
+def _pulse(path):
+    while True:
+        try:
+            path.write_text(str(time.time()), encoding="utf-8")
+        except OSError:
+            return
+        time.sleep(0.2)
+
+if beat is not None:
+    import threading
+    threading.Thread(target=_pulse, args=(beat,), daemon=True).start()
+    grand_code = (
+        "import sys, time; from pathlib import Path; "
+        "p = Path(sys.argv[1]);\\n"
+        "while True:\\n"
+        " p.write_text(str(time.time()), encoding='utf-8'); time.sleep(0.2)\\n"
+    )
+    grand = subprocess.Popen([sys.executable, "-c", grand_code, str(beat)])
+else:
+    grand = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
 pidfile.write_text(f"{os.getppid()}\\n{os.getpid()}\\n{grand.pid}\\n", encoding="utf-8")
 sys.stdout.write("seen-partial\\n")
 sys.stdout.flush()
@@ -313,13 +334,18 @@ def test_watchdog_kills_a_stalled_task_and_continues(tmp_path):
     _write_task(task_dir / "02-next.md", "")
     calls: list[str] = []
     pidfile = project / "pids.txt"
+    beat = project / "beat.txt"
 
     def run_task(*, task, project, **_kwargs):
         calls.append(task.path.name)
         if task.path.name.startswith("01"):
             script = project / "hold.py"
             script.write_text(_HOLD, encoding="utf-8")
-            run_command(python_shell(str(script), str(pidfile)), cwd=project, timeout=60)
+            run_command(
+                python_shell(str(script), str(pidfile), str(beat)),
+                cwd=project,
+                timeout=60,
+            )
         return _passed(task)
 
     started = time.monotonic()
@@ -344,10 +370,16 @@ def test_watchdog_kills_a_stalled_task_and_continues(tmp_path):
     assert state["tasks"]["02-next.md"]["status"] == "passed"
     events = _events(tmp_path / "logs")
     assert any(item.get("kind") == "watchdog_timeout" for item in events)
-    if pidfile.is_file():
-        pids = _pids(pidfile)
-        for pid in pids[1:]:
-            assert _wait_dead(pid), pid
+    # The sleeper and its grandchild both rewrite this file until they die.
+    # A PID check alone is not enough on Windows: OpenProcess still succeeds
+    # for a terminated process while a handle is open, and the PID can be
+    # recycled by the time the next task has finished.
+    assert beat.is_file(), "stalled task never started"
+    frozen = beat.read_text(encoding="utf-8")
+    time.sleep(1.0)
+    assert beat.read_text(encoding="utf-8") == frozen
+    for pid in _pids(pidfile):
+        assert not _is_hold_process(pid), pid
 
 
 def test_step_pauses_when_memory_drops_before_the_step(tmp_path, monkeypatch):
@@ -444,6 +476,13 @@ def _wait_dead(pid: int, seconds: float = 3.0) -> bool:
 
 
 def _pid_alive(pid: int) -> bool:
+    """True when ``pid`` is still running.
+
+    On Windows a terminated process still accepts ``OpenProcess`` until the
+    last handle closes. ``GetExitCodeProcess`` is what distinguishes that
+    from a live process (``STILL_ACTIVE`` is 259).
+    """
+
     if pid <= 0:
         return False
     if os.name == "nt":
@@ -453,12 +492,18 @@ def _pid_alive(pid: int) -> bool:
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
         kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
         kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
         handle = kernel32.OpenProcess(0x1000, False, pid)
-        if handle:
-            kernel32.CloseHandle(handle)
-            return True
-        return False
+        if not handle:
+            return False
+        code = wintypes.DWORD()
+        ok = bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(code)))
+        kernel32.CloseHandle(handle)
+        if not ok:
+            return False
+        return int(code.value) == 259
     status = Path(f"/proc/{pid}/status")
     if not status.is_file():
         return False
@@ -470,6 +515,39 @@ def _pid_alive(pid: int) -> bool:
         if line.startswith("State:"):
             return not line.split()[1].startswith("Z")
     return True
+
+
+def _is_hold_process(pid: int) -> bool:
+    """True when this PID is still the sleeper or the grandchild it started."""
+
+    if pid == os.getpid() or not _pid_alive(pid):
+        return False
+    command = _command_line(pid)
+    return "hold.py" in command or "time.sleep(120)" in command or "time.sleep(0.2)" in command
+
+
+def _command_line(pid: int) -> str:
+    if os.name == "nt":
+        script = (
+            "(Get-CimInstance Win32_Process -Filter "
+            f"'ProcessId={int(pid)}').CommandLine"
+        )
+        try:
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+        return result.stdout or ""
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return ""
+    return raw.replace(b"\0", b" ").decode("utf-8", errors="replace")
 
 
 def _events(log_dir: Path) -> list[dict]:
