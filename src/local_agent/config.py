@@ -57,6 +57,13 @@ OVERRIDABLE = {
     "step_replans",
     "api_lookup",
     "api_lookup_budget",
+    "memory_min_available_mb",
+    "memory_min_commit_mb",
+    "memory_wait_seconds",
+    "memory_poll_seconds",
+    "shared_compilation",
+    "shutdown_dotnet_build_server",
+    "watchdog_minutes",
 }
 
 
@@ -147,6 +154,18 @@ class Profile:
     # instead of a hand-written cheat sheet. Task and AGENTS.md override these.
     api_lookup: bool = True
     api_lookup_budget: int = 1600
+    # Pause a task before it starts a child when physical memory or commit
+    # headroom is below these floors. 0 disables that one check.
+    memory_min_available_mb: int = 512
+    memory_min_commit_mb: int = 1536
+    memory_wait_seconds: int = 60
+    memory_poll_seconds: float = 5.0
+    # VBCSCompiler and the MSBuild node server stay out of unattended runs.
+    # Set shared_compilation true to leave the compiler server alone.
+    shared_compilation: bool = False
+    shutdown_dotnet_build_server: bool = True
+    # Queue watchdog. Independent of the per-task time budget. 0 disables it.
+    watchdog_minutes: float = 30.0
 
     @property
     def offload_flag(self) -> str:
@@ -202,6 +221,15 @@ def _as_bool(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return bool(value)
+
+
+def _as_float(value: Any, key: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError(f"{key} must be a number, got {value!r}")
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise ValueError(f"{key} must be a number, got {value!r}") from exc
 
 
 def _as_int(value: Any, key: str) -> int:
@@ -310,6 +338,15 @@ def profile_from_dict(name: str, data: dict[str, Any], defaults: dict[str, Any])
         step_replans=_as_int(merged.get("step_replans", 1), "step_replans"),
         api_lookup=_as_bool(merged.get("api_lookup", True)),
         api_lookup_budget=_as_int(merged.get("api_lookup_budget", 1600), "api_lookup_budget"),
+        memory_min_available_mb=_as_int(
+            merged.get("memory_min_available_mb", 512), "memory_min_available_mb"
+        ),
+        memory_min_commit_mb=_as_int(merged.get("memory_min_commit_mb", 1536), "memory_min_commit_mb"),
+        memory_wait_seconds=_as_int(merged.get("memory_wait_seconds", 60), "memory_wait_seconds"),
+        memory_poll_seconds=_as_float(merged.get("memory_poll_seconds", 5), "memory_poll_seconds"),
+        shared_compilation=_as_bool(merged.get("shared_compilation", False)),
+        shutdown_dotnet_build_server=_as_bool(merged.get("shutdown_dotnet_build_server", True)),
+        watchdog_minutes=_as_float(merged.get("watchdog_minutes", 30), "watchdog_minutes"),
     )
 
 

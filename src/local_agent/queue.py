@@ -32,6 +32,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,14 +41,23 @@ from typing import Any, Callable
 from local_agent import archive as task_archive
 from local_agent.config import Profile
 from local_agent.control import clear_stop_file, default_stop_file, stop_is_requested
+from local_agent.logging_util import append_event
+from local_agent.memory_guard import (
+    ensure_headroom,
+    resolve_dotnet_settings,
+    resolve_memory_settings,
+    resolve_watchdog_minutes,
+)
 from local_agent.overnight import (
     OvernightResult,
     _commit_with_identity,
     _git,
+    apply_project_defaults,
     ensure_repository,
     load_task,
     run_with_retries,
 )
+from local_agent.procman import TaskGuard, WatchdogAbort, activate, configure_dotnet, deactivate, kill_tracked
 
 STATE_NAME = "queue-state.json"
 SUMMARY_NAME = "queue-summary.md"
@@ -351,6 +361,7 @@ def run_queue(
     run_task: RunTask | None = None,
     retries: int = 1,
     test_first: bool | None = None,
+    watchdog_minutes: float | None = None,
 ) -> QueueResult:
     task_dir = Path(task_dir).resolve()
     project = Path(project).resolve()
@@ -406,6 +417,7 @@ def run_queue(
     stopped_on: str | None = None
     stopped_early = False
     stopped_on_request = False
+    paused_for_memory = False
     request_pending: list[str] = []
     late_stop_note = ""
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -415,7 +427,9 @@ def run_queue(
         if in_progress and not stopped_early and not stopped_on_request:
             status = "running"
         else:
-            status = _overall_status(state, stopped_early, stopped_on_request)
+            status = _overall_status(
+                state, stopped_early, stopped_on_request, paused_low_memory=paused_for_memory
+            )
         summary = render_summary(
             status=status,
             project=project,
@@ -452,15 +466,50 @@ def run_queue(
         key = task_key(path, task_dir)
         _git(project, "checkout", base_branch)
         task = load_task(path)
+        apply_project_defaults(task, project)
+        shared_compilation, shutdown_build_server = resolve_dotnet_settings(task, profile)
+        configure_dotnet(
+            shared_compilation=shared_compilation,
+            shutdown_build_server=shutdown_build_server,
+        )
         task_log = log_dir / key.replace("/", "-")
         started = time.perf_counter()
+        if not ensure_headroom(
+            resolve_memory_settings(task, profile),
+            log=lambda kind, **payload: append_event(task_log, kind, **payload),
+            where="task",
+        ):
+            duration = time.perf_counter() - started
+            _record(
+                state,
+                key,
+                status="paused_low_memory",
+                branch="",
+                commit=None,
+                merge_commit=None,
+                iterations=0,
+                duration=duration,
+                detail=(
+                    "available memory or commit headroom stayed below the configured minimum"
+                ),
+                stored_at=str(path),
+                disposition="stayed",
+            )
+            paused_for_memory = True
+            stopped_on = key
+            stopped_early = True
+            persist(in_progress=True)
+            break
+        watchdog_seconds = resolve_watchdog_minutes(task, profile, watchdog_minutes) * 60.0
         try:
-            result = runner(
+            guarded = _invoke_task(
+                runner,
+                watchdog_seconds=watchdog_seconds,
+                log_dir=task_log,
                 task=task,
                 project=project,
                 profile=profile,
                 client=client,
-                log_dir=task_log,
                 max_seconds=max_seconds_per_task,
                 max_iterations=max_iterations,
                 init_repo=False,
@@ -494,7 +543,52 @@ def run_queue(
                 break
             continue
 
+        if guarded.watchdog:
+            duration = time.perf_counter() - started
+            stored, disposition = _store_failure(path, task_dir, archive=archive)
+            _record(
+                state,
+                key,
+                status="watchdog_timeout",
+                branch="",
+                commit=None,
+                merge_commit=None,
+                iterations=0,
+                duration=duration,
+                detail=guarded.detail or "watchdog_timeout",
+                stored_at=stored,
+                disposition=disposition,
+            )
+            persist(in_progress=True)
+            _return_to_base(project, base_branch)
+            continue
+
+        result = guarded.result
+        if result is None:
+            raise RuntimeError(f"{key} runner returned no result")
         duration = time.perf_counter() - started
+        if result.status == "paused_low_memory":
+            _record(
+                state,
+                key,
+                status="paused_low_memory",
+                branch=result.branch,
+                commit=result.commit,
+                merge_commit=None,
+                iterations=result.iterations,
+                duration=duration,
+                detail=(result.review or "paused_low_memory")[:500],
+                stored_at=str(path),
+                disposition="stayed",
+                attempts=getattr(result, "attempts", 1),
+                attempt_history=getattr(result, "attempt_history", None),
+            )
+            paused_for_memory = True
+            stopped_on = key
+            stopped_early = True
+            persist(in_progress=True)
+            _return_to_base(project, base_branch)
+            break
         if getattr(result, "stop_requested", False):
             stored, disposition = _store_failure(path, task_dir, archive=archive)
             _record(
@@ -630,8 +724,15 @@ def run_queue(
             "Nothing was left pending."
         )
 
-    status = _overall_status(state, stopped_early, stopped_on_request)
-    if stopped_on_request:
+    status = _overall_status(
+        state, stopped_early, stopped_on_request, paused_low_memory=paused_for_memory
+    )
+    if paused_for_memory:
+        message = (
+            "Paused because available memory or commit headroom stayed below the "
+            "configured minimum. The task was left in place and can be run again."
+        )
+    elif stopped_on_request:
         pending_text = ", ".join(request_pending) if request_pending else "(none)"
         message = (
             "Stopped on request. The current task was allowed to finish. "
@@ -662,14 +763,118 @@ def run_queue(
     )
 
 
+@dataclass
+class _GuardedRun:
+    watchdog: bool = False
+    detail: str = ""
+    result: OvernightResult | None = None
+
+
+def _invoke_task(
+    runner: RunTask,
+    *,
+    watchdog_seconds: float,
+    log_dir: Path,
+    **kwargs: Any,
+) -> _GuardedRun:
+    """Run one task and kill its process tree if it stops emitting events.
+
+    The runner stays in-process so tests can pass a fake. It runs on a daemon
+    thread so a stall cannot pin the queue. Silence is measured from the last
+    change to any ``events.jsonl`` under the task log, including attempt
+    subdirectories, and is independent of the task time budget.
+    """
+
+    guard = TaskGuard.create()
+    box: dict[str, Any] = {}
+
+    def target() -> None:
+        activate(guard)
+        try:
+            box["result"] = runner(log_dir=log_dir, **kwargs)
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the queue thread
+            box["error"] = exc
+        finally:
+            deactivate()
+
+    thread = threading.Thread(target=target, name="asimov-task", daemon=True)
+    thread.start()
+    limit = max(0.0, float(watchdog_seconds))
+    poll = 0.2 if limit <= 0 else min(1.0, max(0.05, limit / 10.0))
+    last_token = _events_token(log_dir)
+    last_activity = time.monotonic()
+    fired = False
+    detail = ""
+    while thread.is_alive():
+        thread.join(timeout=poll)
+        if not thread.is_alive():
+            break
+        if limit <= 0:
+            continue
+        token = _events_token(log_dir)
+        if token != last_token:
+            last_token = token
+            last_activity = time.monotonic()
+            continue
+        if time.monotonic() - last_activity < limit:
+            continue
+        minutes = limit / 60.0
+        detail = f"no events for {minutes:g} minutes; killed the task process tree"
+        fired = True
+        guard.abort.set()
+        kill_tracked(guard)
+        append_event(
+            log_dir,
+            "watchdog_timeout",
+            minutes=round(minutes, 3),
+            summary=f"watchdog_timeout {detail}",
+        )
+        thread.join(timeout=5.0)
+        break
+    if fired:
+        return _GuardedRun(watchdog=True, detail=detail)
+    error = box.get("error")
+    if isinstance(error, WatchdogAbort):
+        return _GuardedRun(watchdog=True, detail="watchdog_timeout")
+    if error is not None:
+        raise error
+    return _GuardedRun(result=box.get("result"))
+
+
+def _events_token(log_dir: Path) -> tuple[int, int]:
+    """Size plus newest mtime of every events.jsonl under the task log."""
+
+    root = Path(log_dir)
+    if not root.exists():
+        return (0, 0)
+    total = 0
+    newest = 0
+    for path in root.rglob("events.jsonl"):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        total += int(stat.st_size)
+        newest = max(newest, int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))))
+    return (total, newest)
+
+
 def _default_run_task(**kwargs: Any) -> OvernightResult:
     retries = int(kwargs.pop("retries", 0))
     stop_file = kwargs.pop("stop_file", None)
     return run_with_retries(retries=retries, stop_file=stop_file, **kwargs)
 
 
-def _overall_status(state: dict[str, Any], stopped_early: bool, stopped_on_request: bool) -> str:
+def _overall_status(
+    state: dict[str, Any],
+    stopped_early: bool,
+    stopped_on_request: bool,
+    *,
+    paused_low_memory: bool = False,
+) -> str:
     records = list((state.get("tasks") or {}).values())
+    if paused_low_memory:
+        return "paused_low_memory"
     if stopped_on_request:
         return "stopped_on_request"
     if stopped_early:

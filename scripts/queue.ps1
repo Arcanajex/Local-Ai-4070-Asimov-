@@ -39,6 +39,12 @@
 .PARAMETER MaxHoursPerTask
   Wall-clock budget for each task. Default 8.
 
+.PARAMETER WatchdogMinutes
+  If a running task writes no events for this many minutes, kill its process
+  tree, mark it watchdog_timeout, and continue. Independent of
+  MaxHoursPerTask. Omit it to use the task, AGENTS.md, or profile value
+  (default 30). 0 disables the watchdog.
+
 .PARAMETER Retries
   Extra attempts for a task that stops on the iteration budget, a detected
   loop, or a failed review. Default 1. Each attempt starts from the original
@@ -71,6 +77,7 @@ param(
     [string]$ArchiveDir = '',
     [string]$TasksRoot = '',
     [double]$MaxHoursPerTask = 8,
+    [double]$WatchdogMinutes = -1,
     [int]$MaxIterations = 6,
     [int]$Retries = 1,
     [switch]$TestFirst,
@@ -239,6 +246,11 @@ try {
         '--profile', $Profile,
         '--base-url', $base,
         '--max-hours-per-task', "$MaxHoursPerTask",
+    )
+    if ($PSBoundParameters.ContainsKey('WatchdogMinutes')) {
+        $agentArgs += @('--watchdog-minutes', "$WatchdogMinutes")
+    }
+    $agentArgs += @(
         '--max-iterations', "$MaxIterations",
         '--retries', "$Retries",
         '--log-dir', (Join-Path $logDir ('queue-run-{0}' -f (Get-Date -Format 'yyyyMMdd-HHmmss')))

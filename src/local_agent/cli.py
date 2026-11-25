@@ -175,6 +175,16 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         help="Checked between tasks. Default: runtime/STOP_QUEUE.",
     )
+    queue.add_argument(
+        "--watchdog-minutes",
+        type=float,
+        default=None,
+        help=(
+            "Kill a task that emits no events for this many minutes and continue "
+            "with the next file. Default: the task, then AGENTS.md, then the profile, "
+            "then 30. 0 disables the watchdog. Independent of --max-hours-per-task."
+        ),
+    )
     queue.set_defaults(func=_queue)
 
     archive = sub.add_parser("archive", help="Move one task file into the archive.")
@@ -409,6 +419,7 @@ def _queue(args: argparse.Namespace) -> int:
         stop_file=args.stop_file,
         retries=args.retries,
         test_first=test_first,
+        watchdog_minutes=args.watchdog_minutes,
     )
     if result.message:
         print(result.message, file=sys.stderr)

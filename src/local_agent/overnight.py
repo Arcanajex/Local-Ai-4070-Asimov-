@@ -108,6 +108,15 @@ from local_agent.test_first import (
     restore_rels,
     snapshot_tree,
 )
+from local_agent.memory_guard import (
+    LowMemoryPause,
+    clear_memory_context,
+    install_memory_context,
+    require_memory,
+    resolve_dotnet_settings,
+    resolve_memory_settings,
+)
+from local_agent.procman import configure_dotnet
 from local_agent.shells import platform_shell_commands, run_shell_chain
 from local_agent.tools import Workspace, clear_bytecode, run_command
 from local_agent.traceback_files import format_traceback_files
@@ -193,6 +202,15 @@ class TaskSpec:
     # profile turns it off. The budget is characters in one lookup result.
     api_lookup: bool | None = None
     api_lookup_budget: int | None = None
+    # None means unset. Memory floors, the dotnet build server, and the queue
+    # watchdog then come from AGENTS.md or the profile.
+    memory_min_available_mb: int | None = None
+    memory_min_commit_mb: int | None = None
+    memory_wait_seconds: float | None = None
+    memory_poll_seconds: float | None = None
+    shared_compilation: bool | None = None
+    shutdown_dotnet_build_server: bool | None = None
+    watchdog_minutes: float | None = None
     front_matter_error: str | None = None
 
 
@@ -267,6 +285,13 @@ def parse_task(text: str, path: Path | None = None) -> TaskSpec:
         step_replans=_optional_int(meta, "step_replans"),
         api_lookup=_optional_bool(meta, "api_lookup"),
         api_lookup_budget=_optional_int(meta, "api_lookup_budget"),
+        memory_min_available_mb=_optional_int(meta, "memory_min_available_mb"),
+        memory_min_commit_mb=_optional_int(meta, "memory_min_commit_mb"),
+        memory_wait_seconds=_optional_float(meta, "memory_wait_seconds"),
+        memory_poll_seconds=_optional_float(meta, "memory_poll_seconds"),
+        shared_compilation=_optional_bool(meta, "shared_compilation"),
+        shutdown_dotnet_build_server=_optional_bool(meta, "shutdown_dotnet_build_server"),
+        watchdog_minutes=_optional_float(meta, "watchdog_minutes"),
         front_matter_error=error,
     )
 
@@ -375,6 +400,15 @@ def _optional_int(meta: dict[str, str], key: str) -> int | None:
         return None
 
 
+def _optional_float(meta: dict[str, str], key: str) -> float | None:
+    if key not in meta or str(meta.get(key) or "").strip() == "":
+        return None
+    try:
+        return float(meta[key])
+    except (TypeError, ValueError):
+        return None
+
+
 def _optional_bool(meta: dict[str, str], key: str) -> bool | None:
     if key not in meta or str(meta.get(key) or "").strip() == "":
         return None
@@ -471,6 +505,20 @@ def apply_project_defaults(task: TaskSpec, project: Path) -> TaskSpec:
         task.api_lookup = _optional_bool(meta, "api_lookup")
     if task.api_lookup_budget is None and "api_lookup_budget" in meta:
         task.api_lookup_budget = _optional_int(meta, "api_lookup_budget")
+    if task.memory_min_available_mb is None and "memory_min_available_mb" in meta:
+        task.memory_min_available_mb = _optional_int(meta, "memory_min_available_mb")
+    if task.memory_min_commit_mb is None and "memory_min_commit_mb" in meta:
+        task.memory_min_commit_mb = _optional_int(meta, "memory_min_commit_mb")
+    if task.memory_wait_seconds is None and "memory_wait_seconds" in meta:
+        task.memory_wait_seconds = _optional_float(meta, "memory_wait_seconds")
+    if task.memory_poll_seconds is None and "memory_poll_seconds" in meta:
+        task.memory_poll_seconds = _optional_float(meta, "memory_poll_seconds")
+    if task.shared_compilation is None and "shared_compilation" in meta:
+        task.shared_compilation = _optional_bool(meta, "shared_compilation")
+    if task.shutdown_dotnet_build_server is None and "shutdown_dotnet_build_server" in meta:
+        task.shutdown_dotnet_build_server = _optional_bool(meta, "shutdown_dotnet_build_server")
+    if task.watchdog_minutes is None and "watchdog_minutes" in meta:
+        task.watchdog_minutes = _optional_float(meta, "watchdog_minutes")
     return task
 
 
@@ -566,8 +614,17 @@ def run_overnight(
     snapshots: list[Snapshot] = []
     restored_snapshot = ""
     restore_note = {"ref": ""}
+    memory_token = None
     try:
         apply_project_defaults(task, project)
+        memory_settings = resolve_memory_settings(task, profile)
+        shared_compilation, shutdown_build_server = resolve_dotnet_settings(task, profile)
+        configure_dotnet(
+            shared_compilation=shared_compilation,
+            shutdown_build_server=shutdown_build_server,
+        )
+        memory_token = install_memory_context(memory_settings, logger.event)
+        require_memory("task")
         task.verify_commands = resolve_verify_commands(task, profile)
         max_plan_turns = resolve_turn_budget(
             max_plan_turns, DEFAULT_PLAN_TURNS, task.plan_turns, profile.plan_turns
@@ -816,6 +873,7 @@ def run_overnight(
                 implement_status = "completed"
             implement = PhaseResult(implement_status, step_result.note, 0)
         else:
+            require_memory("implement")
             implement = _run_phase(
                 client, workspace, logger, profile,
                 with_project_context(implement_prompt(task.body, plan_text), context_block),
@@ -1141,6 +1199,35 @@ def run_overnight(
             restored_snapshot=restored_snapshot,
             steps_note=step_result.report_line,
         )
+    except LowMemoryPause as exc:
+        detail = str(exc)
+        if branch:
+            try:
+                return _finish(
+                    project, logger, task, profile, branch, log_dir,
+                    status="paused_low_memory",
+                    iterations=iterations,
+                    tests_passed=False,
+                    test_output=test_output,
+                    review=detail,
+                    plan_status=plan_status,
+                    identity_note=identity_note,
+                    review_passed=False,
+                )
+            except Exception:
+                pass
+        logger.event("run_end", status="paused_low_memory", summary="paused_low_memory")
+        return OvernightResult(
+            status="paused_low_memory",
+            branch=branch,
+            report_path=None,
+            commit=None,
+            iterations=iterations,
+            tests_passed=False,
+            log_dir=log_dir,
+            review_passed=False,
+            review=detail,
+        )
     except Exception as exc:
         logger.event("run_error", summary=f"{type(exc).__name__}: {exc}")
         if branch:
@@ -1159,6 +1246,7 @@ def run_overnight(
                 pass
         raise
     finally:
+        clear_memory_context(memory_token)
         logger.close()
 
 
@@ -1349,6 +1437,7 @@ def _run_step_loop(
         for attempt in range(1, STEP_ATTEMPTS + 1):
             if time.monotonic() >= deadline:
                 return finish_time(last_output)
+            require_memory("step")
             count = len(display)
             logger.event(
                 "step_start",
@@ -1604,6 +1693,7 @@ def _run_step_gate(
     the task test command runs instead.
     """
 
+    require_memory("step")
     command = normalize_verify_command(step.verify)
     suite = use_suite or (not command) or commands_match(command, test_command)
     if not suite:
@@ -2065,6 +2155,7 @@ def _restore_last_snapshot(project: Path, snapshot: Snapshot, logger: RunLogger)
 
 
 def _run_checks(project: Path, test_command: str, lint_command: str | None) -> tuple[str, bool]:
+    require_memory("checks")
     clear_bytecode(project)
     test = run_command(test_command, cwd=project, timeout=600)
     parts = [f"$ {test_command}\n{test.output}"]
